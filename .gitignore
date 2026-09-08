@@ -1,0 +1,18 @@
+# Secrets and local configuration
+mobile_app/.env.local
+mobile_app/.env.*.local
+
+# Node / Vite / Capacitor generated files
+mobile_app/node_modules/
+mobile_app/dist/
+mobile_app/android/.gradle/
+mobile_app/android/build/
+mobile_app/android/app/build/
+mobile_app/android/local.properties
+
+# Arduino editor and build files
+*.hex
+*.bin
+*.elf
+.vscode/
+.DS_Store
