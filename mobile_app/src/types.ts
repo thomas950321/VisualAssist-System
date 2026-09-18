@@ -26,3 +26,18 @@ export const DEFAULT_TELEMETRY: CaneTelemetry = {
   receivedAt: 0,
   raw: '',
 };
+
+export type ChestTelemetry = {
+  ultrasonicCm: number;
+  emergencyBrake: boolean;
+  connected: boolean;
+  lastUpdated: number;
+};
+
+export const DEFAULT_CHEST_TELEMETRY: ChestTelemetry = {
+  ultrasonicCm: 400,
+  emergencyBrake: false,
+  connected: false,
+  lastUpdated: 0,
+};
+

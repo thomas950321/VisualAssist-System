@@ -46,6 +46,14 @@ const char* FALLBACK_AP_PASSWORD = "blindassist";
 // Official on-board BOOT button. Use it as a prototype trigger.
 #define TRIGGER_BUTTON_PIN 0
 
+// ---------- Layer 0: Chest Hardware Emergency Brake Pins ----------
+// Dedicated non-camera pins on ESP32-S3-EYE
+#define ULTRASONIC_TRIG_PIN 1
+#define ULTRASONIC_ECHO_PIN 2
+#define BRAKE_ALARM_PIN     44
+#define EMERGENCY_BRAKE_DIST_CM 80.0f
+#define ULTRASONIC_TIMEOUT_US 24000 // ~4 meters max
+
 #define STREAM_BOUNDARY "blind-assist-boundary"
 static const char* STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" STREAM_BOUNDARY;
 static const char* STREAM_PART = "\r\n--" STREAM_BOUNDARY "\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
@@ -53,6 +61,13 @@ static const char* STREAM_PART = "\r\n--" STREAM_BOUNDARY "\r\nContent-Type: ima
 httpd_handle_t cameraHttpd = nullptr;
 volatile uint32_t triggerCounter = 0;
 uint32_t lastButtonChangeMs = 0;
+
+// Layer 0 Fast Path Telemetry
+float chestDistanceCm = 400.0f;
+bool emergencyBrakeActive = false;
+uint32_t lastSonarSampleMs = 0;
+uint32_t lastAlarmToggleMs = 0;
+bool alarmState = false;
 
 static void addCorsHeaders(httpd_req_t* request) {
   httpd_resp_set_hdr(request, "Access-Control-Allow-Origin", "*");
@@ -134,9 +149,13 @@ static esp_err_t captureHandler(httpd_req_t* request) {
 static esp_err_t statusHandler(httpd_req_t* request) {
   addCorsHeaders(request);
   httpd_resp_set_type(request, "application/json");
-  char payload[128];
-  snprintf(payload, sizeof(payload), "{\"triggerCounter\":%lu,\"ip\":\"%s\"}",
-           static_cast<unsigned long>(triggerCounter), WiFi.localIP().toString().c_str());
+  char payload[192];
+  snprintf(payload, sizeof(payload),
+           "{\"triggerCounter\":%lu,\"ip\":\"%s\",\"ultrasonicCm\":%.1f,\"emergencyBrake\":%s}",
+           static_cast<unsigned long>(triggerCounter),
+           WiFi.localIP().toString().c_str(),
+           chestDistanceCm,
+           emergencyBrakeActive ? "true" : "false");
   return httpd_resp_send(request, payload, HTTPD_RESP_USE_STRLEN);
 }
 
@@ -225,18 +244,67 @@ static void connectWiFi() {
   Serial.println(WiFi.softAPIP());
 }
 
+static float readUltrasonicDistanceCm() {
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+
+  const unsigned long duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, ULTRASONIC_TIMEOUT_US);
+  if (duration == 0) return 400.0f;
+  const float dist = duration * 0.0343f / 2.0f;
+  return (dist > 1.0f && dist < 450.0f) ? dist : 400.0f;
+}
+
+static void updateLayer0EmergencyBrake() {
+  const uint32_t now = millis();
+  // Sample every ~25ms (< 30ms latency for urgent brake)
+  if (now - lastSonarSampleMs >= 25) {
+    lastSonarSampleMs = now;
+    const float rawDist = readUltrasonicDistanceCm();
+    if (rawDist < chestDistanceCm) {
+      chestDistanceCm = rawDist;
+    } else {
+      chestDistanceCm = 0.7f * chestDistanceCm + 0.3f * rawDist;
+    }
+    emergencyBrakeActive = (chestDistanceCm < EMERGENCY_BRAKE_DIST_CM);
+  }
+
+  // Active fast pulse alarm when in emergency brake distance
+  if (emergencyBrakeActive) {
+    if (now - lastAlarmToggleMs >= 35) { // Rapid 35ms pulse
+      lastAlarmToggleMs = now;
+      alarmState = !alarmState;
+      digitalWrite(BRAKE_ALARM_PIN, alarmState ? HIGH : LOW);
+    }
+  } else {
+    alarmState = false;
+    digitalWrite(BRAKE_ALARM_PIN, LOW);
+  }
+}
+
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
+
   pinMode(TRIGGER_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
+  pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+  pinMode(BRAKE_ALARM_PIN, OUTPUT);
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+  digitalWrite(BRAKE_ALARM_PIN, LOW);
   delay(300);
 
   if (!initCamera()) return;
   connectWiFi();
   startCameraServer();
+  Serial.println("Layer 0 Hardware Emergency Brake active (< 80cm threshold, 25ms sampling).");
 }
 
 void loop() {
+  updateLayer0EmergencyBrake();
+
   const bool pressed = digitalRead(TRIGGER_BUTTON_PIN) == LOW;
   const uint32_t now = millis();
   if (pressed && now - lastButtonChangeMs > 700) {
@@ -244,5 +312,5 @@ void loop() {
     triggerCounter++;
     Serial.printf("Physical trigger event: %lu; phone may poll /status and call /capture.\n", static_cast<unsigned long>(triggerCounter));
   }
-  delay(20);
+  delay(5);
 }

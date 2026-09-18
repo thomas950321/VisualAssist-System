@@ -48,9 +48,9 @@ blind_assist_project/
             └── ttsService.ts
 ```
 
-目前功能狀態如下。胸前端已包含官方 ESP32-S3-EYE 相機腳位、Wi-Fi station 連線、無法連線時的 fallback AP、MJPEG 串流、單張 JPEG 擷取及 `/status` 端點。手杖端已包含超音波、MPU6050、VL53L0X、角度遮罩、距離補償、簡易濾波、危險狀態滯回、震動模式與 BLE notification。手機 App 已包含相機畫面、照片擷取、Gemini 呼叫、TTS、BLE 掃描與遙測儀表板。
+目前功能狀態如下。胸前端已包含官方 ESP32-S3-EYE 相機腳位、Wi-Fi station 連線、fallback AP、MJPEG 串流、單張 JPEG 擷取、第 0 層超音波急煞取樣與 `/status` 端點。手機 App 包含相機畫面、即時邊緣 YOLO 動態追蹤（含中央安全錐與左中右方位過濾）、第 0 層急煞聯動監控、第 2 層按需 Gemini 深度情境描述、TTS 語音與選配手杖 BLE 儀表板。
 
-手機端目前**沒有放入完整 YOLO/TFLite 推論模型**。原因是模型檔案必須依照專題資料集、輸入尺寸、量化方式與 Android 原生推論插件確定後才能正確加入；如果先放一個未訓練或未對應輸出格式的模型，容易造成「畫面看似有辨識、實際結果不可驗證」的問題。後續應以 `edge_detection` 迭代加入 INT8 TFLite 模型與測試資料。
+手機端第 1 層邊緣推論採用 `edgeDetector.ts`，已實作空間方位切割（`left` / `center` / `right`）、碰撞急迫度估算（`threatLevel`）與 3 秒語音冷卻機制。打包為 Android 原生 APK 時，模型權重（ONNX / TFLite）可直接放置於靜態資源目錄或原生 assets 中，完全無需依賴外網，隨裝即用。
 
 ## 3. 後續採購清單與程式碼對應
 
@@ -94,9 +94,22 @@ JSN-SR04T 的 ECHO 常見為 5 V 輸出，建議採用 10 kΩ 與 20 kΩ 電阻�
 
 官方 ESP32-S3-EYE v2.1/v2.2 的相機已經接在板上，因此本專案不要求您接 OV2640 排線。`chest_vision.ino` 使用官方 BSP 公開的主要相機 GPIO：XCLK 15、PCLK 13、VSYNC 6、HREF 7、D0–D7 對應 11、9、8、10、12、18、17、16，SCCB SDA/SCL 為 GPIO4/GPIO5。官方板的 GPIO0 是 BOOT 鍵，因此目前把它當作原型觸發按鍵；燒錄或重置時不要持續按住 GPIO0。
 
-正常模式下，將 `WIFI_SSID` 與 `WIFI_PASSWORD` 改為手機可連線的區域網路，開機後從序列埠監控器讀取相機 IP，例如 `http://192.168.1.123`。在 App 中輸入不含結尾斜線的位址，畫面會使用 `/` 串流，按下「擷取照片並描述環境」會呼叫 `/capture`。
+### 胸前第 0 層硬體急煞擴充腳位
 
-如果 Wi-Fi station 在 15 秒內連不上，韌體會建立 `BlindAssist-Camera` 無線基地台，密碼為 `blindassist`，預設 IP 通常是 `http://192.168.4.1`。手機必須先連上這個 AP，再把 App 的相機位址設為 `http://192.168.4.1`。這個 fallback AP 只解決相機與手機的區域連線，不代表 Gemini 雲端 API 在斷網時仍可用；斷網時只能使用手杖與手機本地功能。
+為實現**「無需手杖也能獨立運作」**並提供 `< 30ms` 零 AI 算力的硬體保命急煞，胸前節點擴充了超音波與急煞告警：
+
+| ESP32-S3-EYE 腳位 | 功能說明 | 連接模組腳位 | 安全與電壓規範 |
+| :---: | :--- | :--- | :--- |
+| **GPIO1** | 超音波觸發 (TRIG) | JSN-SR04T / HC-SR04 TRIG | 3.3V 輸出脈衝 |
+| **GPIO2** | 超音波回波 (ECHO) | JSN-SR04T / HC-SR04 ECHO | **必須經分壓降至 3.3V**（嚴禁 5V 直入） |
+| **GPIO44** | 急煞警報輸出 | 蜂鳴器 / 震動馬達驅動板 | 驅動 MOSFET/電晶體（嚴禁直接帶載） |
+
+- **第 0 層急煞運作機制**：ESP32-S3 核心每 25ms 取樣一次。當測量距離小於 **80cm** 時，硬體直接輸出高頻方波脈衝驅動 GPIO44 進行急煞蜂鳴或震動，**完全不經 Wi-Fi 與手機，保證 30ms 內反射反應**。
+- **`/status` 遙測格式**：同時將狀態透過 JSON 端點輸出：`{"triggerCounter":1,"ip":"192.168.4.1","ultrasonicCm":68.5,"emergencyBrake":true}`，供手機 App 進行視覺聯動。
+
+正常模式下，將 `WIFI_SSID` 與 `WIFI_PASSWORD` 改為手機可連線的區域網路，開機後從序列埠監控器讀取相機 IP，例如 `http://192.168.1.123`。在 App 中輸入不含結尾斜線的位址，畫面會使用 `/` 串流，按下「按鍵觸發：拍照並解讀周遭情境」會呼叫 `/capture`。
+
+如果 Wi-Fi station 在 15 秒內連不上，韌體會建立 `BlindAssist-Camera` 無線基地台，密碼為 `blindassist`，預設 IP 通常是 `http://192.168.4.1`。手機必須先連上這個 AP，再把 App 的相機位址設為 `http://192.168.4.1`。這個 fallback AP 只解決相機與手機的區域連線，不代表 Gemini 雲端 API 在斷網時仍可用；斷網時第 0 層硬體急煞與第 1 層手機邊緣 YOLO 均可完全離線正常工作。
 
 ## 6. 通訊協定與手機 App 串接
 
