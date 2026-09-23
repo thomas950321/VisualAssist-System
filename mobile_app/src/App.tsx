@@ -12,9 +12,14 @@ import {
   cameraStreamUrl,
   captureCameraJpeg,
   fetchChestStatus,
+  fetchLatestAudio,
+  playAudioOnChest,
   type ChestStatus,
 } from './services/cameraService';
-import { describeImageWithGemini } from './services/geminiService';
+import {
+  describeImageWithGemini,
+  askGeminiWithImageAndAudio,
+} from './services/geminiService';
 import { cancelSpeech, speak } from './services/ttsService';
 import {
   LocalYoloEdgeDetector,
@@ -32,11 +37,20 @@ import './styles.css';
 
 const CAMERA_URL_STORAGE_KEY = 'blind-assist-camera-url';
 
+interface ConversationItem {
+  id: string;
+  type: 'voice' | 'text' | 'scene';
+  question?: string;
+  answer: string;
+  timestamp: number;
+}
+
 function App() {
   const [cameraUrl, setCameraUrl] = useState(() => localStorage.getItem(CAMERA_URL_STORAGE_KEY) ?? 'http://192.168.4.1');
   
   // Layer 0: Chest Hardware Emergency Brake Telemetry
   const [chestTelemetry, setChestTelemetry] = useState<ChestTelemetry>(DEFAULT_CHEST_TELEMETRY);
+  const [chestStatus, setChestStatus] = useState<ChestStatus | null>(null);
 
   // Layer 1: Edge YOLO Detection State
   const [trackingEnabled, setTrackingEnabled] = useState(true);
@@ -48,9 +62,16 @@ function App() {
     timestamp: 0,
   });
 
-  // Layer 2: Cloud Gemini Description State
+  // Layer 2: Cloud Gemini Description & Voice Q&A State
   const [describing, setDescribing] = useState(false);
   const [description, setDescription] = useState<GeminiDescription | null>(null);
+  const [conversation, setConversation] = useState<ConversationItem[]>([]);
+  const [textQuestion, setTextQuestion] = useState('');
+
+  // 實體按鍵與音訊計數器追蹤 (防重複觸發)
+  const lastTriggerCounterRef = useRef<number>(0);
+  const lastAudioCounterRef = useRef<number>(0);
+  const isHandlingVoiceRef = useRef<boolean>(false);
 
   // Optional: Smart Cane Telemetry
   const [telemetry, setTelemetry] = useState<CaneTelemetry>(DEFAULT_TELEMETRY);
@@ -64,13 +85,16 @@ function App() {
   const [lastEvent, setLastEvent] = useState('系統就緒：三層邊緣導盲架構已啟動');
   const streamImgRef = useRef<HTMLImageElement | null>(null);
   const lastUrgentBrakeRef = useRef(false);
+  const [isRealModel, setIsRealModel] = useState(false);
 
   // 初始化第 1 層本地邊緣 YOLO 偵測器
   useEffect(() => {
     const detector = new LocalYoloEdgeDetector();
     detector.load().then(() => {
       edgeDetectorRef.current = detector;
-      setLastEvent('第 1 層：手機本地 YOLO 動態模型載入就緒');
+      const isReal = detector.isRealModelRunning();
+      setIsRealModel(isReal);
+      setLastEvent(isReal ? '第 1 層：ONNX YOLOv8n 硬體加速模型載入就緒' : '第 1 層：手機本地 YOLO 動態感知就緒 (開發模擬模式)');
     });
   }, []);
 
@@ -123,7 +147,79 @@ function App() {
     return () => window.clearInterval(interval);
   }, [trackingEnabled]);
 
-  // 第 0 層：胸前硬體遙測輪詢 (/status)
+  // 第 2 層：胸前雙向語音提問處理核心
+  async function handleChestVoiceQandA() {
+    if (isHandlingVoiceRef.current) return;
+    isHandlingVoiceRef.current = true;
+    setDescribing(true);
+    setError('');
+    setLastEvent('🎙️ 接收到胸前麥克風提問！正在抓取照片與音訊送往 Gemini…');
+
+    try {
+      // 1. 同步抓取照片與胸前錄製之音訊
+      const image = await captureCameraJpeg(cameraUrl);
+      const audio = await fetchLatestAudio(cameraUrl);
+
+      // 2. 呼叫 Gemini 多模態問答
+      const answer = await askGeminiWithImageAndAudio(image, audio);
+      
+      // 3. 語音朗讀回答
+      speak(answer, 'normal');
+
+      // 4. 更新對話與紀錄
+      const newEntry: ConversationItem = {
+        id: String(Date.now()),
+        type: 'voice',
+        question: '胸前麥克風語音提問',
+        answer,
+        timestamp: Date.now(),
+      };
+      setConversation((prev) => [newEntry, ...prev.slice(0, 10)]);
+      setDescription({ text: answer, generatedAt: Date.now() });
+      setLastEvent(`🤖 Gemini 回答：${answer}`);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : '語音問答失敗';
+      setError(errMsg);
+      setLastEvent(`❌ 語音問答錯誤：${errMsg}`);
+    } finally {
+      setDescribing(false);
+      isHandlingVoiceRef.current = false;
+    }
+  }
+
+  // 第 2 層：手動文字或點擊情境描述
+  async function describeEnvironment(customQuestion?: string) {
+    if (describing) return;
+    setError('');
+    setDescribing(true);
+    try {
+      const image = await captureCameraJpeg(cameraUrl);
+      const text = customQuestion
+        ? await askGeminiWithImageAndAudio(image, null, customQuestion)
+        : await describeImageWithGemini(image);
+
+      const nextDescription = { text, generatedAt: Date.now() };
+      setDescription(nextDescription);
+      speak(text, 'normal');
+
+      const newEntry: ConversationItem = {
+        id: String(Date.now()),
+        type: customQuestion ? 'text' : 'scene',
+        question: customQuestion,
+        answer: text,
+        timestamp: Date.now(),
+      };
+      setConversation((prev) => [newEntry, ...prev.slice(0, 10)]);
+      setLastEvent(customQuestion ? `🤖 問答完成：${text}` : '第 2 層認知：已完成單張環境深度描述');
+      if (customQuestion) setTextQuestion('');
+    } catch (descriptionError) {
+      setError(descriptionError instanceof Error ? descriptionError.message : '環境描述失敗');
+    } finally {
+      setDescribing(false);
+    }
+  }
+
+  // 第 0 層 & 實體按鍵遙測輪詢 (/status)
   useEffect(() => {
     if (demoMode) return;
     if (!cameraUrl) return;
@@ -131,6 +227,8 @@ function App() {
     const timer = window.setInterval(async () => {
       try {
         const status: ChestStatus = await fetchChestStatus(cameraUrl);
+        setChestStatus(status);
+
         const ultrasonicCm = status.ultrasonicCm ?? 400;
         const emergencyBrake = Boolean(status.emergencyBrake || ultrasonicCm < 80);
 
@@ -147,60 +245,46 @@ function App() {
           setLastEvent('第 0 層急煞：胸前硬體偵測距離小於 80cm！');
         }
         lastUrgentBrakeRef.current = emergencyBrake;
+
+        // 偵測胸前板「按住提問錄音完畢放開」事件
+        if (
+          status.audioCounter !== undefined &&
+          lastAudioCounterRef.current > 0 &&
+          status.audioCounter > lastAudioCounterRef.current
+        ) {
+          lastAudioCounterRef.current = status.audioCounter;
+          lastTriggerCounterRef.current = status.triggerCounter;
+          void handleChestVoiceQandA();
+        } else if (
+          status.triggerCounter !== undefined &&
+          lastTriggerCounterRef.current > 0 &&
+          status.triggerCounter > lastTriggerCounterRef.current
+        ) {
+          // 純短按拍照事件
+          lastTriggerCounterRef.current = status.triggerCounter;
+          void describeEnvironment();
+        }
+
+        // 初次連線校正計數器基準點
+        if (lastTriggerCounterRef.current === 0 && status.triggerCounter !== undefined) {
+          lastTriggerCounterRef.current = status.triggerCounter;
+        }
+        if (lastAudioCounterRef.current === 0 && status.audioCounter !== undefined) {
+          lastAudioCounterRef.current = status.audioCounter;
+        }
       } catch {
         setChestTelemetry((prev) => ({ ...prev, connected: false }));
       }
-    }, 450);
+    }, 400);
 
     return () => window.clearInterval(timer);
   }, [cameraUrl, demoMode]);
-
-  // 展示模式模擬
-  useEffect(() => {
-    if (!demoMode) return;
-    const timer = window.setInterval(() => {
-      const mockDist = 45 + Math.round(Math.random() * 160);
-      const isBrake = mockDist < 80;
-      setChestTelemetry({
-        ultrasonicCm: mockDist,
-        emergencyBrake: isBrake,
-        connected: true,
-        lastUpdated: Date.now(),
-      });
-
-      if (isBrake && !lastUrgentBrakeRef.current) {
-        speak('急煞警告！前方緊急障礙！', 'urgent');
-        setLastEvent('展示模式：觸發第 0 層急煞');
-      }
-      lastUrgentBrakeRef.current = isBrake;
-    }, 800);
-
-    return () => window.clearInterval(timer);
-  }, [demoMode]);
 
   function saveCameraUrl() {
     const normalized = cameraUrl.trim().replace(/\/$/, '');
     setCameraUrl(normalized);
     localStorage.setItem(CAMERA_URL_STORAGE_KEY, normalized);
     setLastEvent(`已儲存胸前相機位址：${normalized}`);
-  }
-
-  // 第 2 層：雲端 Gemini 按需深度認知
-  async function describeEnvironment() {
-    setError('');
-    setDescribing(true);
-    try {
-      const image = await captureCameraJpeg(cameraUrl);
-      const text = await describeImageWithGemini(image);
-      const nextDescription = { text, generatedAt: Date.now() };
-      setDescription(nextDescription);
-      speak(text, 'normal');
-      setLastEvent('第 2 層認知：已完成單張環境深度描述');
-    } catch (descriptionError) {
-      setError(descriptionError instanceof Error ? descriptionError.message : '環境描述失敗');
-    } finally {
-      setDescribing(false);
-    }
   }
 
   // 智慧手杖 BLE 控制（選配）
@@ -310,6 +394,9 @@ function App() {
               <span className={`tag ${trackingEnabled ? 'active-tag' : ''}`}>
                 {trackingEnabled ? 'YOLO 追蹤中' : '已暫停追蹤'}
               </span>
+              <span className={`tag ${isRealModel ? 'active-tag' : ''}`}>
+                {isRealModel ? '⚡ ONNX WebGL' : '🛠️ 模擬備援'}
+              </span>
               <span className="tag">MJPEG</span>
             </div>
           </div>
@@ -402,32 +489,110 @@ function App() {
           </div>
         </section>
 
-        {/* 第 2 層：雲端多模態 AI 認知問答卡片 */}
+        {/* 第 2 層：雲端多模態 AI 認知問答卡片 (雙向語音問答大腦) */}
         <section className="card cloud-card">
           <div className="card-heading">
             <div>
-              <div className="layer-badge layer-2">第 2 層 · 雲端認知大腦 (按需觸發)</div>
-              <h2>全景情境與文字解讀</h2>
+              <div className="layer-badge layer-2">第 2 層 · 雲端認知大腦 (按需多模態問答)</div>
+              <h2>全景情境與雙向語音提問</h2>
             </div>
-            <span className="tag">Gemini API</span>
+            <div className="badge-group">
+              <span className={`tag ${chestStatus?.isRecording ? 'critical' : ''}`}>
+                {chestStatus?.isRecording ? '🔴 胸前錄音中…' : chestStatus?.micReady ? '🎙️ PDM 麥克風就緒' : '麥克風未偵測'}
+              </span>
+              <span className="tag">
+                {chestStatus?.speakerReady ? '🔊 喇叭擴大機' : 'Gemini 2.5'}
+              </span>
+            </div>
           </div>
 
           <p className="cloud-explain">
-            本層專為讀取店家招牌、環境全景敘事與尋物設計。<strong>非避障通道</strong>，單次拍照按需觸發，不產生連續延遲與高額流量。
+            本層專為視障者讀取<strong>店家招牌、紅綠燈秒數、環境全景敘事與尋物</strong>設計。
           </p>
 
+          <div className="voice-tip-box">
+            <span className="voice-tip-icon">💡</span>
+            <div className="voice-tip-text">
+              <strong>胸前直覺操作：</strong>
+              長按胸前板 <code>BOOT (GPIO 0)</code> 鍵對著麥克風說話提問，放開按鈕即自動拍照並發送給 Gemini，隨後透過語音朗讀回答！
+            </div>
+          </div>
+
+          {/* 常用語音快捷提問按鈕 */}
+          <div className="quick-question-row">
+            <button
+              className="chip-btn"
+              disabled={describing}
+              onClick={() => void describeEnvironment('這家店招牌寫什麼？販賣什麼？')}
+            >
+              🏷️ 店家招牌？
+            </button>
+            <button
+              className="chip-btn"
+              disabled={describing}
+              onClick={() => void describeEnvironment('前面路口紅燈或綠燈還有幾秒？')}
+            >
+              🚦 紅綠燈秒數？
+            </button>
+            <button
+              className="chip-btn"
+              disabled={describing}
+              onClick={() => void describeEnvironment('前方地面是否有階梯、水坑或施工障礙？')}
+            >
+              🚧 路況障礙？
+            </button>
+          </div>
+
+          {/* 手動輸入文字提問 */}
+          <form
+            className="question-input-row"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (textQuestion.trim()) {
+                void describeEnvironment(textQuestion.trim());
+              }
+            }}
+          >
+            <input
+              type="text"
+              value={textQuestion}
+              onChange={(e) => setTextQuestion(e.target.value)}
+              placeholder="輸入問題或對胸前長按提問…"
+              disabled={describing}
+            />
+            <button type="submit" className="primary" disabled={describing || !textQuestion.trim()}>
+              {describing ? '分析中…' : '提問'}
+            </button>
+          </form>
+
           <button
-            className="primary wide trigger-btn"
+            className="secondary wide trigger-btn"
             onClick={() => void describeEnvironment()}
             disabled={describing || !cameraUrl}
           >
-            {describing ? '雲端分析中，請稍候…' : '📷 按鍵觸發：拍照並解讀周遭情境'}
+            {describing ? '雲端分析中，請稍候…' : '📷 單拍快門：解讀全景情境'}
           </button>
 
-          {description && (
-            <div className="description-box">
-              <strong>最新情境描述：</strong>
-              <p>{description.text}</p>
+          {/* 最新對話歷程列表 */}
+          {conversation.length > 0 && (
+            <div className="conversation-panel">
+              <strong>💬 最新問答紀錄：</strong>
+              <div className="conversation-list">
+                {conversation.map((item) => (
+                  <div key={item.id} className="conversation-item">
+                    {item.question && (
+                      <div className="conv-question">
+                        <span className="conv-tag">{item.type === 'voice' ? '🎙️ 語音' : '⌨️ 文字'}</span>
+                        <span>{item.question}</span>
+                      </div>
+                    )}
+                    <div className="conv-answer">
+                      <span className="conv-tag ai">🤖 Gemini</span>
+                      <p>{item.answer}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
 

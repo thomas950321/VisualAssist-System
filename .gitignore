@@ -1,6 +1,11 @@
 # Secrets and local configuration
+mobile_app/.env
 mobile_app/.env.local
 mobile_app/.env.*.local
+
+# PlatformIO & build artifacts
+.pio/
+compile_commands.json
 
 # Node / Vite / Capacitor generated files
 mobile_app/node_modules/
