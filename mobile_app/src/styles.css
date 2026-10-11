@@ -279,9 +279,145 @@ button:hover:not(:disabled) { transform: translateY(-1px); }
   border: 1px solid #0284c7;
 }
 
-.cane-subpanel { margin-top: 24px; padding-top: 18px; border-top: 1px solid #1c3554; }
-.cane-subpanel h3 { margin: 0 0 12px; font-size: 16px; color: #9bb7dd; }
+/* 當前問答聚焦卡片 */
+.current-qa-card {
+  background: linear-gradient(135deg, rgba(14, 165, 233, 0.12), rgba(30, 58, 138, 0.2));
+  border: 1px solid #0284c7;
+  border-radius: 12px;
+  padding: 14px;
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+.qa-bubble {
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.qa-bubble.user {
+  background: rgba(15, 23, 42, 0.7);
+  border: 1px solid rgba(56, 189, 248, 0.3);
+}
+.qa-bubble.ai {
+  background: rgba(2, 44, 34, 0.4);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+}
+.qa-bubble-header {
+  display: flex;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.qa-role-badge {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.qa-role-badge.user-badge {
+  background: #0284c7;
+  color: #ffffff;
+}
+.qa-role-badge.ai-badge {
+  background: #059669;
+  color: #ffffff;
+}
+.qa-text {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.6;
+}
+.qa-text.user-text {
+  color: #7dd3fc;
+  font-weight: 600;
+}
+.qa-text.ai-text {
+  color: #f1f5f9;
+}
+
 .last-event-text { margin: 4px 0 0; color: #9bb4d6; font-size: 13px; }
+
+.voice-mode-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: rgba(15, 23, 42, 0.6);
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(51, 65, 85, 0.6);
+  margin-bottom: 12px;
+}
+
+.speaker-target-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.toolbar-label {
+  font-size: 13px;
+  color: #94a3b8;
+  font-weight: 600;
+}
+
+.target-pill {
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid #334155;
+  background: #1e293b;
+  color: #cbd5e1;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.target-pill:hover {
+  border-color: #38bdf8;
+  color: #f8fafc;
+}
+
+.target-pill.active {
+  background: linear-gradient(135deg, #0284c7, #0369a1);
+  border-color: #38bdf8;
+  color: #ffffff;
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.35);
+}
+
+.mic-live-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 700;
+  border: 1px solid #38bdf8;
+  background: linear-gradient(135deg, rgba(2, 132, 199, 0.2), rgba(14, 165, 233, 0.1));
+  color: #38bdf8;
+  cursor: pointer;
+  transition: all 0.25s ease;
+}
+
+.mic-live-btn:hover {
+  background: linear-gradient(135deg, rgba(2, 132, 199, 0.35), rgba(14, 165, 233, 0.2));
+  transform: translateY(-1px);
+}
+
+.mic-live-btn.listening {
+  background: linear-gradient(135deg, #dc2626, #b91c1c);
+  color: #ffffff;
+  border-color: #f87171;
+  animation: pulse-border 1.5s infinite;
+}
+
+@keyframes pulse-border {
+  0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6); }
+  70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
 
 @media (max-width: 780px) {
   .app-shell { padding: 22px 14px; }
@@ -294,4 +430,5 @@ button:hover:not(:disabled) { transform: translateY(-1px); }
   .form-row label { width: 100%; }
   .form-row .secondary { width: 100%; }
 }
+
 

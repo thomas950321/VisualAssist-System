@@ -11,7 +11,6 @@
     "cap:android": "npm run cap:sync && cap open android"
   },
   "dependencies": {
-    "@capacitor-community/bluetooth-le": "^6.0.1",
     "@capacitor/android": "^7.4.0",
     "@capacitor/core": "^7.4.0",
     "@tensorflow/tfjs": "^4.22.0",

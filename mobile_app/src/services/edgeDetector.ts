@@ -174,7 +174,7 @@ export class LocalYoloEdgeDetector implements EdgeDetector {
     return this.realModelLoaded;
   }
 
-  async detect(source: HTMLImageElement | HTMLCanvasElement): Promise<Detection[]> {
+  async detect(source: HTMLImageElement | HTMLCanvasElement, allowSimulation: boolean = false): Promise<Detection[]> {
     if (!this.ready) return [];
 
     // 若真實模型就緒，執行真實 ONNX 推論管線
@@ -182,12 +182,18 @@ export class LocalYoloEdgeDetector implements EdgeDetector {
       try {
         return await this.runRealInference(source);
       } catch (e) {
-        console.error('[YOLO Edge] 模型推論時發生異常，暫時降級使用模擬數據', e);
+        console.warn('[YOLO Edge] 真實模型推論暫態異常 (可能是畫面繪製或張量傳輸):', e);
+        if (!allowSimulation) return [];
       }
     }
 
-    // 備援：動態高擬真模擬管線（確保在開發或未匯入模型時功能完全正常運作）
-    return this.runSimulatedInference();
+    // 只有在明確允許模擬 (例如使用者開啟展示模式) 時，才執行模擬假人管線
+    if (allowSimulation) {
+      return this.runSimulatedInference();
+    }
+
+    // 真實運作模式下，若無真實模型或未偵測到物體，安全回傳空陣列，絕不捏造幽靈障礙物
+    return [];
   }
 
   /**

@@ -1,17 +1,24 @@
-const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY as string | undefined;
-const GEMINI_MODEL = (import.meta.env.VITE_GEMINI_MODEL as string | undefined) ?? 'gemini-2.5-flash';
+const GEMINI_API_KEY = (import.meta.env.VITE_GEMINI_API_KEY as string | undefined) || '';
+const GEMINI_MODEL = (import.meta.env.VITE_GEMINI_MODEL as string | undefined) || 'gemini-flash-latest';
+
+export interface GeminiQaResult {
+  userQuestion: string;
+  answer: string;
+}
 
 const DEFAULT_PROMPT = [
-  '你是視障者的環境描述助理。請只用繁體中文回答，控制在 45 字以內。',
-  '請依序描述：正前方最重要的障礙物或危險、可通行方向、必要時補充地標。',
-  '不要把不確定的內容說成確定事實，不要提供醫療或安全保證。',
+  '你是視障者的環境描述助理。',
+  '請嚴格依照下列格式輸出兩行（繁體中文）：',
+  '【使用者提問】：環境全景認知',
+  '【助理回答】：依序描述正前方最重要的障礙物、可通行方向與地標（控制在 45 字以內）',
 ].join('\n');
 
 const VOICE_QUESTION_PROMPT = [
   '你是視障者的即時語音問答助理。',
-  '使用者剛才透過胸前麥克風對你說話提問（請聆聽隨附的音訊內容）。',
-  '請仔細結合隨附的現場照片與使用者的問題，用繁體中文給出最精確、親切且實用的回答。',
-  '回答請保持口語化、精簡扼要，長度控制在 60 字以內，方便語音播報。',
+  '隨附內容包含：使用者透過胸前麥克風說話提問的音訊，以及相機現場照片。',
+  '請嚴格依照下列兩行格式輸出，方便系統將提問轉寫並呈現於畫面上：',
+  '【使用者提問】：將音訊中使用者所說的話完整精確轉寫為繁體中文（若聽不清楚或無人聲則寫「語音提問」）',
+  '【助理回答】：結合照片針對使用者問題給出精確、親切、口語的繁體中文回答（60字以內）',
 ].join('\n');
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -24,41 +31,73 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
+function parseGeminiResponse(rawText: string, fallbackQuestion?: string): GeminiQaResult {
+  const qMatch = rawText.match(/【使用者提問】[：:]\s*(.*?)(?=\n|【助理回答】|$)/s);
+  const aMatch = rawText.match(/【助理回答】[：:]\s*(.*)/s);
+
+  if (qMatch && aMatch) {
+    return {
+      userQuestion: qMatch[1].trim() || (fallbackQuestion ?? '語音提問'),
+      answer: aMatch[1].trim(),
+    };
+  }
+
+  const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
+  if (lines.length >= 2 && (lines[0].includes('提問') || lines[0].includes('問題'))) {
+    return {
+      userQuestion: lines[0].replace(/【.*?】|^.*?[:：]/g, '').trim() || (fallbackQuestion ?? '語音提問'),
+      answer: lines.slice(1).join(' ').replace(/【.*?】|^.*?[:：]/g, '').trim(),
+    };
+  }
+
+  return {
+    userQuestion: fallbackQuestion ?? '語音提問',
+    answer: rawText.replace(/【.*?】/g, '').trim(),
+  };
+}
+
 /**
  * 多模態 Gemini 認知問答
- * 支援「純照片描述」或「照片 + 使用者語音提問」同步發送
+ * 支援「純文字提問」、「純照片描述」或「照片 + 使用者語音提問」同步發送
  */
 export async function askGeminiWithImageAndAudio(
-  imageBlob: Blob,
+  imageBlob?: Blob | null,
   audioBlob?: Blob | null,
   textQuestion?: string
-): Promise<string> {
+): Promise<GeminiQaResult> {
   if (!GEMINI_API_KEY || GEMINI_API_KEY === 'replace_with_your_key') {
     throw new Error('尚未設定 VITE_GEMINI_API_KEY；請先在 mobile_app/.env 填入你的 Gemini API Key。');
   }
 
-  const imageBase64 = arrayBufferToBase64(await imageBlob.arrayBuffer());
   const parts: Array<{ text?: string; inline_data?: { mime_type: string; data: string } }> = [];
 
-  // 1. 設定系統提示詞與提問
+  // 1. 設定提示詞與提問
   if (audioBlob) {
     parts.push({ text: VOICE_QUESTION_PROMPT });
   } else if (textQuestion) {
-    parts.push({ text: `使用者提問：${textQuestion}\n請結合照片用繁體中文簡明回答（60字內）：` });
+    const textPrompt = [
+      '你是視障者的即時問答助理。請嚴格依照格式輸出兩行（繁體中文）：',
+      `【使用者提問】：${textQuestion}`,
+      '【助理回答】：針對問題給予口語、簡明且親切的回答（60字以內）',
+    ].join('\n');
+    parts.push({ text: textPrompt });
   } else {
     parts.push({ text: DEFAULT_PROMPT });
   }
 
-  // 2. 加入照片
-  parts.push({
-    inline_data: {
-      mime_type: imageBlob.type || 'image/jpeg',
-      data: imageBase64,
-    },
-  });
+  // 2. 加入照片 (若有提供)
+  if (imageBlob && imageBlob.size > 0) {
+    const imageBase64 = arrayBufferToBase64(await imageBlob.arrayBuffer());
+    parts.push({
+      inline_data: {
+        mime_type: imageBlob.type || 'image/jpeg',
+        data: imageBase64,
+      },
+    });
+  }
 
   // 3. 若有語音提問音訊，加入音訊資料
-  if (audioBlob) {
+  if (audioBlob && audioBlob.size > 0) {
     const audioBase64 = arrayBufferToBase64(await audioBlob.arrayBuffer());
     parts.push({
       inline_data: {
@@ -68,38 +107,64 @@ export async function askGeminiWithImageAndAudio(
     });
   }
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{
-        role: 'user',
-        parts,
-      }],
-      generationConfig: {
-        temperature: 0.2,
-        maxOutputTokens: 256,
-      },
-    }),
-  });
+  const candidateModels = [GEMINI_MODEL, 'gemini-flash-lite-latest', 'gemini-3.8-flash'];
+  const uniqueModels = Array.from(new Set(candidateModels));
+  let lastError: Error | null = null;
 
-  if (!response.ok) {
-    const message = await response.text();
-    throw new Error(`Gemini API 失敗：HTTP ${response.status} ${message.slice(0, 180)}`);
+  for (const model of uniqueModels) {
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 12000);
+
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-goog-api-key': GEMINI_API_KEY,
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          contents: [{
+            role: 'user',
+            parts,
+          }],
+          generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: 256,
+          },
+        }),
+      });
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.warn(`[Gemini] 模型 ${model} 回傳 HTTP ${response.status}: ${errorText.slice(0, 100)}，嘗試備用模型...`);
+        lastError = new Error(`HTTP ${response.status}: ${errorText.slice(0, 100)}`);
+        continue;
+      }
+
+      const payload = (await response.json()) as {
+        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      };
+      const text = payload.candidates?.[0]?.content?.parts?.map((part) => part.text ?? '').join('').trim();
+      if (text) {
+        return parseGeminiResponse(text, textQuestion);
+      }
+    } catch (err) {
+      clearTimeout(timeoutId);
+      console.warn(`[Gemini] 模型 ${model} 請求失敗:`, err);
+      lastError = err instanceof Error ? err : new Error(String(err));
+    }
   }
 
-  const payload = (await response.json()) as {
-    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-  };
-  const text = payload.candidates?.[0]?.content?.parts?.map((part) => part.text ?? '').join('').trim();
-  if (!text) throw new Error('Gemini 沒有回傳可播報文字。');
-  return text;
+  throw new Error(`Gemini 回應失敗：${lastError?.message || '所有模型皆無回應'}`);
 }
 
 /**
- * 向下相容原有函式呼叫
+ * 向下相容原有函式呼叫 (僅回傳回答文字)
  */
 export async function describeImageWithGemini(imageBlob: Blob): Promise<string> {
-  return askGeminiWithImageAndAudio(imageBlob);
+  const result = await askGeminiWithImageAndAudio(imageBlob);
+  return result.answer;
 }

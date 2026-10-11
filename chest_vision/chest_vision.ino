@@ -21,8 +21,8 @@
 #include "soc/rtc_cntl_reg.h"
 #include "driver/i2s.h"
 
-const char* WIFI_SSID = "00000000";
-const char* WIFI_PASSWORD = "00000001";
+const char* WIFI_SSID = "TP-Link_Kobe";
+const char* WIFI_PASSWORD = "0955062890";
 const char* FALLBACK_AP_SSID = "BlindAssist-Camera";
 const char* FALLBACK_AP_PASSWORD = "blindassist";
 
@@ -137,10 +137,13 @@ const char* getCameraErrorDetail(esp_err_t err) {
 
 static void addCorsHeaders(httpd_req_t* request) {
   httpd_resp_set_hdr(request, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(request, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  httpd_resp_set_hdr(request, "Access-Control-Allow-Headers", "*");
   httpd_resp_set_hdr(request, "Cache-Control", "no-store, no-cache, must-revalidate");
 }
 
 static esp_err_t sendJpegFrame(httpd_req_t* request) {
+  addCorsHeaders(request);
   if (!cameraReady) {
     httpd_resp_set_type(request, "application/json; charset=utf-8");
     httpd_resp_set_status(request, "503 Service Unavailable");
@@ -389,6 +392,8 @@ static void startCameraServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.max_uri_handlers = 8;
+  config.max_open_sockets = 7;
+  config.lru_purge_enable = true;
 
   httpd_uri_t streamUri = { .uri = "/", .method = HTTP_GET, .handler = streamHandler, .user_ctx = nullptr };
   httpd_uri_t captureUri = { .uri = "/capture", .method = HTTP_GET, .handler = captureHandler, .user_ctx = nullptr };
@@ -679,8 +684,11 @@ void setup() {
   }
   Serial.printf("[INFO] 內部 Heap 剩餘記憶體: %u KB\n", ESP.getFreeHeap() / 1024);
 
-  // 2. 引腳初始化
+  // 2. 引腳初始化 (加強 GPIO 0 內部上拉，避免腳位浮動誤觸)
   pinMode(TRIGGER_BUTTON_PIN, INPUT_PULLUP);
+  gpio_pullup_en(GPIO_NUM_0);
+  gpio_pulldown_dis(GPIO_NUM_0);
+
   pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
   pinMode(ULTRASONIC_ECHO_PIN, INPUT);
   pinMode(BRAKE_ALARM_PIN, OUTPUT);
@@ -719,8 +727,10 @@ void loop() {
       buttonHeld = true;
       buttonPressStartMs = now;
     } else {
+      const uint32_t holdTime = now - buttonPressStartMs;
+
       // 按住超過 350ms: 進入對話提問錄音模式
-      if (!isRecording && (now - buttonPressStartMs > 350)) {
+      if (!isRecording && holdTime > 350) {
         isRecording = true;
         audioRecordedBytes = 0;
         digitalWrite(BRAKE_ALARM_PIN, HIGH); // 錄音指示燈恆亮
@@ -737,9 +747,26 @@ void loop() {
             audioRecordedBytes += bytesRead;
           }
         } else {
-          // 達到最大長度上限 (6秒)
-          Serial.println("[AUDIO] 錄音緩衝區已達上限 (6 秒)");
+          // 達到最大長度上限 (6秒)，自動結束錄音與拍照
+          isRecording = false;
+          digitalWrite(BRAKE_ALARM_PIN, LOW);
+          audioCounter++;
+          triggerCounter++;
+          Serial.printf("[AUDIO] 🛑 錄音已達 6 秒上限，自動結束！bytes: %lu, audioCounter=%lu\n",
+                        static_cast<unsigned long>(audioRecordedBytes),
+                        static_cast<unsigned long>(audioCounter));
         }
+      }
+
+      // 安全機制：若按鍵長按超過 7 秒（可能為腳位懸空或開機誤觸），自動重設按鍵狀態防止卡死
+      if (holdTime > 7000) {
+        if (isRecording) {
+          isRecording = false;
+          digitalWrite(BRAKE_ALARM_PIN, LOW);
+          audioCounter++;
+          triggerCounter++;
+        }
+        buttonHeld = false; // 解除長按狀態
       }
     }
   } else {

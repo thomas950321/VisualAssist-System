@@ -30,28 +30,70 @@ export type ChestStatus = {
 };
 
 export async function captureCameraJpeg(baseUrl: string): Promise<Blob> {
-  const response = await fetch(cameraCaptureUrl(baseUrl), {
-    method: 'GET',
-    cache: 'no-store',
-  });
-  if (!response.ok) {
-    throw new Error(`相機擷取失敗：HTTP ${response.status}`);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 4000);
+  try {
+    const response = await fetch(cameraCaptureUrl(baseUrl), {
+      method: 'GET',
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!response.ok) {
+      throw new Error(`相機擷取失敗：HTTP ${response.status}`);
+    }
+    return await response.blob();
+  } catch (e) {
+    clearTimeout(timeoutId);
+    throw e;
   }
-  return response.blob();
 }
 
 /**
- * 從胸前板獲取最新錄製的使用者提問音訊 (WAV 格式)
+ * 優先從當前畫面 <img> 元素瞬間快照（0 網路延遲，避免與 ESP32 MJPEG 串流搶佔連線）
+ * 若相機當前無法取得影格，優雅回傳 null，避免卡死或中斷使用者文字問答
+ */
+export async function captureCurrentStreamFrame(imgElement: HTMLImageElement | null, baseUrl: string): Promise<Blob | null> {
+  if (imgElement && imgElement.naturalWidth > 0) {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = imgElement.naturalWidth;
+      canvas.height = imgElement.naturalHeight;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(imgElement, 0, 0);
+        const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+        if (blob && blob.size > 100) return blob;
+      }
+    } catch {
+      // 若受瀏覽器跨域限制則嘗試網路請求
+    }
+  }
+  if (!baseUrl) return null;
+  try {
+    return await captureCameraJpeg(baseUrl);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 從胸前板獲取最新錄製的使用者提問音訊 (WAV 格式，含逾時保護)
  */
 export async function fetchLatestAudio(baseUrl: string): Promise<Blob | null> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 2500);
   try {
     const response = await fetch(cameraAudioUrl(baseUrl), {
       method: 'GET',
       cache: 'no-store',
+      signal: controller.signal,
     });
+    clearTimeout(timeoutId);
     if (!response.ok) return null;
     return await response.blob();
   } catch {
+    clearTimeout(timeoutId);
     return null;
   }
 }
@@ -75,12 +117,21 @@ export async function playAudioOnChest(baseUrl: string, audioBlob: Blob): Promis
 
 export async function fetchChestStatus(baseUrl: string): Promise<ChestStatus> {
   const url = normalizeBaseUrl(baseUrl);
-  const response = await fetch(`${url}/status`, {
-    method: 'GET',
-    cache: 'no-store',
-  });
-  if (!response.ok) {
-    throw new Error(`相機狀態讀取失敗：HTTP ${response.status}`);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 2500);
+  try {
+    const response = await fetch(`${url}/status`, {
+      method: 'GET',
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!response.ok) {
+      throw new Error(`相機狀態讀取失敗：HTTP ${response.status}`);
+    }
+    return await response.json();
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
   }
-  return response.json();
 }
