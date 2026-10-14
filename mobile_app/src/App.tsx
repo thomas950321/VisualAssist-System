@@ -75,6 +75,9 @@ function App() {
   const lastTriggerCounterRef = useRef<number>(-1);
   const lastAudioCounterRef = useRef<number>(-1);
   const isHandlingVoiceRef = useRef<boolean>(false);
+  const describingRef = useRef<boolean>(false);
+  const analysisGenerationRef = useRef<number>(0);
+  const inferenceInFlightRef = useRef<boolean>(false);
 
   // ESP32 相機串流狀態
   const [streamError, setStreamError] = useState<boolean>(false);
@@ -125,12 +128,15 @@ function App() {
     }
 
     const interval = window.setInterval(async () => {
+      // 推論可能超過一個輪詢週期；禁止並行推論堆積，否則會造成「停不下來」的分析與語音佇列。
+      if (inferenceInFlightRef.current) return;
       const detector = edgeDetectorRef.current;
       if (!detector || !detector.isLoaded()) return;
 
       const img = streamImgRef.current;
       if (img && img.naturalWidth > 0) {
         try {
+          inferenceInFlightRef.current = true;
           // 僅在 demoMode 開啟時才允許模擬假目標，避免真實相機無故捏造幽靈行人
           const results = await detector.detect(img, demoMode);
           setDetections(results);
@@ -182,18 +188,22 @@ function App() {
           }
         } catch {
           // 推論暫態忽略
+        } finally {
+          inferenceInFlightRef.current = false;
         }
       }
     }, 90);
 
     return () => window.clearInterval(interval);
-  }, [trackingEnabled, demoMode]);
+  }, [trackingEnabled, demoMode, cameraUrl, useChestSpeaker]);
 
   // 第 2 層：胸前雙向語音提問處理核心
   async function handleChestVoiceQandA() {
     if (isHandlingVoiceRef.current) return;
     isHandlingVoiceRef.current = true;
+    const generation = ++analysisGenerationRef.current;
     setDescribing(true);
+    describingRef.current = true;
     setError('');
     setLastEvent('🎙️ 接收到胸前麥克風提問！正在抓取照片與音訊送往 Gemini…');
 
@@ -204,6 +214,8 @@ function App() {
 
       // 2. 呼叫 Gemini 多模態問答 (包含語音辨識 STT 轉寫與回答)
       const qaResult = await askGeminiWithImageAndAudio(image, audio);
+
+      if (generation !== analysisGenerationRef.current) return;
       
       // 3. 語音朗讀回答 (優先推播至 ESP32 胸前板喇叭，失敗時本機發聲)
       void speakResponse(qaResult.answer, cameraUrl, useChestSpeaker, (s) => setLastEvent(s));
@@ -224,8 +236,11 @@ function App() {
       setError(errMsg);
       setLastEvent(`❌ 語音問答錯誤：${errMsg}`);
     } finally {
-      setDescribing(false);
-      isHandlingVoiceRef.current = false;
+      if (generation === analysisGenerationRef.current) {
+        setDescribing(false);
+        describingRef.current = false;
+        isHandlingVoiceRef.current = false;
+      }
     }
   }
 
@@ -291,9 +306,11 @@ function App() {
 
   // 第 2 層：手動文字或點擊情境描述
   async function describeEnvironment(customQuestion?: string) {
-    if (describing) return;
+    if (describingRef.current || isHandlingVoiceRef.current) return;
+    const generation = ++analysisGenerationRef.current;
     setError('');
     setDescribing(true);
+    describingRef.current = true;
     try {
       const image = await captureCurrentStreamFrame(streamImgRef.current, cameraUrl);
       if (!image && !customQuestion) {
@@ -302,6 +319,8 @@ function App() {
       const qaResult = customQuestion
         ? await askGeminiWithImageAndAudio(image, null, customQuestion)
         : await askGeminiWithImageAndAudio(image);
+
+      if (generation !== analysisGenerationRef.current) return;
 
       const nextDescription = { text: qaResult.answer, generatedAt: Date.now() };
       setDescription(nextDescription);
@@ -324,7 +343,10 @@ function App() {
       setError(msg);
       setLastEvent(`❌ 提問失敗：${msg}`);
     } finally {
-      setDescribing(false);
+      if (generation === analysisGenerationRef.current) {
+        setDescribing(false);
+        describingRef.current = false;
+      }
     }
   }
 
@@ -443,7 +465,10 @@ function App() {
             onClick={() => {
               setTrackingEnabled(false);
               setDescribing(false);
+              analysisGenerationRef.current += 1;
+              describingRef.current = false;
               isHandlingVoiceRef.current = false;
+              inferenceInFlightRef.current = false;
               cancelSpeech();
               if (recognitionRef.current) {
                 try { recognitionRef.current.stop(); } catch {}

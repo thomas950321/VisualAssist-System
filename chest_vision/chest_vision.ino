@@ -97,6 +97,7 @@ volatile bool isRecording = false;
 volatile uint32_t audioCounter = 0;
 bool micReady = false;
 bool speakerReady = false;
+volatile bool audioPlaybackBusy = false;
 uint32_t buttonPressStartMs = 0;
 bool buttonHeld = false;
 
@@ -324,6 +325,9 @@ static esp_err_t audioHandler(httpd_req_t* request) {
 // ---------- 喇叭正弦波音調產生器 (免檔案、直接驅動 MAX98357) ----------
 static void playTone(uint16_t freq, uint16_t durationMs) {
   if (!speakerReady) return;
+  if (audioPlaybackBusy) return;
+  audioPlaybackBusy = true;
+  i2s_zero_dma_buffer(I2S_NUM_1);
   const uint32_t sampleRate = AUDIO_SAMPLE_RATE; // 16000
   const size_t totalSamples = (sampleRate * durationMs) / 1000;
   int16_t buffer[256 * 2]; // 立體聲雙聲道緩衝區 (LRCLK interleaved)
@@ -344,6 +348,7 @@ static void playTone(uint16_t freq, uint16_t durationMs) {
     i2s_write(I2S_NUM_1, buffer, chunk * sizeof(int16_t) * 2, &bytesWritten, portMAX_DELAY);
     samplesRemaining -= chunk;
   }
+  audioPlaybackBusy = false;
 }
 
 // 開機成功旋律 (Do-Mi-Sol)
@@ -385,9 +390,18 @@ static esp_err_t playHandler(httpd_req_t* request) {
     return httpd_resp_send(request, "{\"error\":\"EMPTY_BODY\"}", HTTPD_RESP_USE_STRLEN);
   }
 
+  if (audioPlaybackBusy) {
+    httpd_resp_set_status(request, "409 Conflict");
+    return httpd_resp_send(request, "{\"error\":\"AUDIO_PLAYBACK_BUSY\"}", HTTPD_RESP_USE_STRLEN);
+  }
+
   char buf[1024];
   int curLen = 0;
-  bool skipHeader = true; // 如果是 WAV，略過前 44 bytes
+  uint8_t wavHeader[44] = {};
+  size_t headerBytes = 0;
+  bool headerParsed = false;
+  audioPlaybackBusy = true;
+  i2s_zero_dma_buffer(I2S_NUM_1);
 
   while (curLen < totalLen) {
     int received = httpd_req_recv(request, buf, sizeof(buf));
@@ -397,19 +411,40 @@ static esp_err_t playHandler(httpd_req_t* request) {
     }
     curLen += received;
 
-    char* playData = buf;
-    size_t playLen = received;
-    if (skipHeader && playLen >= 44 && strncmp(buf, "RIFF", 4) == 0) {
-      playData += 44;
-      playLen -= 44;
-      skipHeader = false;
+    uint8_t* playData = reinterpret_cast<uint8_t*>(buf);
+    size_t playLen = static_cast<size_t>(received);
+
+    // HTTP 接收不保證第一次就拿到完整 44-byte WAV header；先跨 chunk 累積，
+    // 避免把標頭的一部分送進 I2S 造成喇叭無聲或爆音。
+    if (!headerParsed) {
+      const size_t needed = sizeof(wavHeader) - headerBytes;
+      const size_t copyLen = min(needed, playLen);
+      memcpy(wavHeader + headerBytes, playData, copyLen);
+      headerBytes += copyLen;
+      playData += copyLen;
+      playLen -= copyLen;
+      if (headerBytes < sizeof(wavHeader)) continue;
+
+      const bool validWav = memcmp(wavHeader, "RIFF", 4) == 0 &&
+                            memcmp(wavHeader + 8, "WAVE", 4) == 0;
+      if (!validWav) {
+        audioPlaybackBusy = false;
+        httpd_resp_set_status(request, "415 Unsupported Media Type");
+        return httpd_resp_send(request, "{\"error\":\"INVALID_WAV\"}", HTTPD_RESP_USE_STRLEN);
+      }
+      headerParsed = true;
     }
 
     if (playLen > 0) {
+      // MAX98357 設定為 16-bit 雙聲道，維持 4-byte frame 對齊。
+      playLen -= playLen % (sizeof(int16_t) * 2);
+      if (playLen == 0) continue;
       size_t bytesWritten = 0;
       i2s_write(I2S_NUM_1, playData, playLen, &bytesWritten, portMAX_DELAY);
     }
   }
+
+  audioPlaybackBusy = false;
 
   httpd_resp_set_type(request, "application/json; charset=utf-8");
   return httpd_resp_send(request, "{\"status\":\"PLAY_COMPLETED\"}", HTTPD_RESP_USE_STRLEN);
@@ -836,6 +871,11 @@ void loop() {
       if (!isRecording && holdTime > 350) {
         isRecording = true;
         audioRecordedBytes = 0;
+        // 丟棄按鍵前殘留的 DMA 資料，確保 /audio 只包含本次提問。
+        if (micReady) {
+          i2s_zero_dma_buffer(I2S_NUM_0);
+          i2s_start(I2S_NUM_0);
+        }
         digitalWrite(BRAKE_ALARM_PIN, HIGH); // 錄音指示燈恆亮
         playTone(800, 70); // 提問收音開始提示音
         Serial.println("[AUDIO] 🎙️ 進入按住說話錄音提問模式...");

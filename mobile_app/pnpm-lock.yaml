@@ -8,9 +8,6 @@ importers:
 
   .:
     dependencies:
-      '@capacitor-community/bluetooth-le':
-        specifier: ^6.0.1
-        version: 6.1.0(@capacitor/core@7.6.9)
       '@capacitor/android':
         specifier: ^7.4.0
         version: 7.6.9(@capacitor/core@7.6.9)
@@ -133,11 +130,6 @@ packages:
   '@babel/types@7.29.8':
     resolution: {integrity: sha512-Vj1jF3cPfxg7OAfoI7QnVKLoILlm2JF9pnVHrX8qx7AHMiYWT+NDAA7jChlNgRS4WTLc/fD1lXLmPixluj+3Gg==}
     engines: {node: '>=6.9.0'}
-
-  '@capacitor-community/bluetooth-le@6.1.0':
-    resolution: {integrity: sha512-hnNChEwV+xNOVqDYI4bfkQtFtvEyzBMlgYs+6xsLYTJVl0v8h6Hn3nCwjW9l6LH0tMzYaRYlFLCiGHKPHt1N0Q==}
-    peerDependencies:
-      '@capacitor/core': ^6.0.0
 
   '@capacitor/android@7.6.9':
     resolution: {integrity: sha512-jvfU42aOuj92/KJqRscfDm+5612WzJainFL09xjJgD9oI3OMXN4PBfccn8Ig9i8x7bkVqZv/XNwFshiIRqmggg==}
@@ -603,9 +595,6 @@ packages:
 
   '@types/slice-ansi@4.0.0':
     resolution: {integrity: sha512-+OpjSaq85gvlZAYINyzKpLeiFkSC4EsC6IIiT6v6TLSU5k5U83fHGj9Lel8oKEXM0HqgrMVCjXPDPVICtxF7EQ==}
-
-  '@types/web-bluetooth@0.0.20':
-    resolution: {integrity: sha512-g9gZnnXVq7gM7v3tJCWV/qw7w+KeOlSHAhgF9RytFyifW6AF61hdT2ucrYhPq9hLs5JIryeupHV3qGk95dH9ow==}
 
   '@vitejs/plugin-react@5.2.0':
     resolution: {integrity: sha512-YmKkfhOAi3wsB1PhJq5Scj3GXMn3WvtQ/JC0xoopuHoXSdmtdStOpFrYaT1kie2YgFBcIe64ROzMYRjCrYOdYw==}
@@ -1373,11 +1362,6 @@ snapshots:
       '@babel/helper-string-parser': 7.29.7
       '@babel/helper-validator-identifier': 7.29.7
 
-  '@capacitor-community/bluetooth-le@6.1.0(@capacitor/core@7.6.9)':
-    dependencies:
-      '@capacitor/core': 7.6.9
-      '@types/web-bluetooth': 0.0.20
-
   '@capacitor/android@7.6.9(@capacitor/core@7.6.9)':
     dependencies:
       '@capacitor/core': 7.6.9
@@ -1799,8 +1783,6 @@ snapshots:
   '@types/seedrandom@2.4.34': {}
 
   '@types/slice-ansi@4.0.0': {}
-
-  '@types/web-bluetooth@0.0.20': {}
 
   '@vitejs/plugin-react@5.2.0(vite@7.3.6(@types/node@26.6.1))':
     dependencies:

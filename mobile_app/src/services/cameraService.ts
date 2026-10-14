@@ -118,14 +118,20 @@ export async function fetchLatestAudio(baseUrl: string): Promise<Blob | null> {
  * 將音訊發送至胸前板，由內建 MAX98357 擴大機與喇叭接口播放
  */
 export async function playAudioOnChest(baseUrl: string, audioBlob: Blob): Promise<boolean> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
   try {
     const url = normalizeBaseUrl(baseUrl);
     const response = await fetch(`${url}/play`, {
       method: 'POST',
       body: audioBlob,
+      headers: { 'Content-Type': audioBlob.type || 'audio/wav' },
+      signal: controller.signal,
     });
+    clearTimeout(timeoutId);
     return response.ok;
   } catch {
+    clearTimeout(timeoutId);
     return false;
   }
 }
