@@ -4,18 +4,40 @@
  */
 import { playAudioOnChest } from './cameraService';
 
+let lastSpokenText = '';
+let lastSpokenTime = 0;
+
 export function cancelSpeech(): void {
   if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-    window.speechSynthesis.cancel();
+    try {
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.pause();
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.resume();
+    } catch {
+      window.speechSynthesis.cancel();
+    }
   }
 }
 
 export function speak(text: string, priority: 'normal' | 'urgent' = 'normal'): void {
   if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
-  if (priority === 'urgent') {
-    window.speechSynthesis.cancel();
-  }
+  const now = Date.now();
   const cleanText = text.replace(/[*#`_~]/g, '').trim();
+  
+  // 防重複與防塞車機制：若同一句話在 10 秒內重複，或前一句話尚未講完，不重複塞入佇列
+  if (cleanText === lastSpokenText && now - lastSpokenTime < 10000) {
+    return;
+  }
+  
+  // 若為緊急，或是佇列太長，先徹底清空
+  if (priority === 'urgent' || window.speechSynthesis.speaking) {
+    cancelSpeech();
+  }
+
+  lastSpokenText = cleanText;
+  lastSpokenTime = now;
+
   const utterance = new SpeechSynthesisUtterance(cleanText);
   utterance.lang = 'zh-TW';
   utterance.rate = priority === 'urgent' ? 1.15 : 1.0;
@@ -101,7 +123,8 @@ function audioBufferToWav(buffer: AudioBuffer, targetSampleRate = 16000): Blob {
  */
 export async function synthesizeTextToWav(text: string): Promise<Blob> {
   const cleanText = text.replace(/[*#`_~]/g, '').trim();
-  const url = `https://translate.google.com/translate_tts?ie=UTF-8&tl=zh-TW&client=tw-ob&q=${encodeURIComponent(cleanText)}`;
+  // 透過 Vite Proxy (/api/tts) 轉發，解決前端瀏覽器直接 fetch Google TTS 的 CORS 跨來源限制
+  const url = `/api/tts?ie=UTF-8&tl=zh-TW&client=tw-ob&q=${encodeURIComponent(cleanText)}`;
   
   const response = await fetch(url);
   if (!response.ok) {
@@ -139,13 +162,15 @@ export async function speakResponse(
         onStatusUpdate?.('🔊 已透過胸前板喇叭播放回答！');
         return;
       }
-      onStatusUpdate?.('⚠️ 胸前板喇叭無回應，切換至本機喇叭播放');
+      onStatusUpdate?.('⚠️ 胸前板喇叭推播未成功，保持靜音');
     } catch (e) {
-      console.warn('推播至胸前板失敗，退回本機語音:', e);
-      onStatusUpdate?.('⚠️ 胸前板語音失敗，已自動由手機/電腦朗讀');
+      console.warn('推播至胸前板失敗:', e);
+      onStatusUpdate?.('⚠️ 胸前板語音合成失敗，保持靜音');
     }
+    // 嚴格保證：使用者選擇胸前板時，絕對不退回電腦喇叭狂念，電腦保持完全安靜！
+    return;
   }
 
-  // 本地設備語音朗讀
+  // 僅當使用者明確選擇「手機/電腦喇叭」時，才由本機朗讀
   speak(text, 'normal');
 }

@@ -30,7 +30,7 @@ export interface EdgeDetector {
   isLoaded(): boolean;
   isRealModelRunning(): boolean;
   load(): Promise<void>;
-  detect(image: HTMLImageElement | HTMLCanvasElement): Promise<Detection[]>;
+  detect(image: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement): Promise<Detection[]>;
 }
 
 // COCO 80 類標準中文對照表 (針對視障導航優先優化)
@@ -174,7 +174,7 @@ export class LocalYoloEdgeDetector implements EdgeDetector {
     return this.realModelLoaded;
   }
 
-  async detect(source: HTMLImageElement | HTMLCanvasElement, allowSimulation: boolean = false): Promise<Detection[]> {
+  async detect(source: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement, allowSimulation: boolean = false): Promise<Detection[]> {
     if (!this.ready) return [];
 
     // 若真實模型就緒，執行真實 ONNX 推論管線
@@ -199,7 +199,7 @@ export class LocalYoloEdgeDetector implements EdgeDetector {
   /**
    * 真實 YOLOv8 ONNX 前端推論
    */
-  private async runRealInference(source: HTMLImageElement | HTMLCanvasElement): Promise<Detection[]> {
+  private async runRealInference(source: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement): Promise<Detection[]> {
     if (!this.session || !this.offscreenCtx || !this.offscreenCanvas) return [];
 
     const ctx = this.offscreenCtx;

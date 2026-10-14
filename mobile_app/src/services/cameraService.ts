@@ -2,7 +2,17 @@ const normalizeBaseUrl = (baseUrl: string): string => baseUrl.trim().replace(/\/
 
 export const cameraStreamUrl = (baseUrl: string): string => {
   const url = normalizeBaseUrl(baseUrl);
-  return url ? `${url}/` : '';
+  if (!url) return '';
+  try {
+    const parsed = new URL(url);
+    if (!parsed.port || parsed.port === '80') {
+      parsed.port = '81';
+      return parsed.toString();
+    }
+  } catch {
+    // fallback
+  }
+  return `${url}/`;
 };
 
 export const cameraCaptureUrl = (baseUrl: string): string => {
@@ -53,20 +63,26 @@ export async function captureCameraJpeg(baseUrl: string): Promise<Blob> {
  * 優先從當前畫面 <img> 元素瞬間快照（0 網路延遲，避免與 ESP32 MJPEG 串流搶佔連線）
  * 若相機當前無法取得影格，優雅回傳 null，避免卡死或中斷使用者文字問答
  */
-export async function captureCurrentStreamFrame(imgElement: HTMLImageElement | null, baseUrl: string): Promise<Blob | null> {
-  if (imgElement && imgElement.naturalWidth > 0) {
-    try {
-      const canvas = document.createElement('canvas');
-      canvas.width = imgElement.naturalWidth;
-      canvas.height = imgElement.naturalHeight;
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(imgElement, 0, 0);
-        const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.85));
-        if (blob && blob.size > 100) return blob;
+export async function captureCurrentStreamFrame(source: HTMLImageElement | HTMLVideoElement | null, baseUrl: string): Promise<Blob | null> {
+  if (source) {
+    const isVideo = source instanceof HTMLVideoElement;
+    const width = isVideo ? (source as HTMLVideoElement).videoWidth : (source as HTMLImageElement).naturalWidth;
+    const height = isVideo ? (source as HTMLVideoElement).videoHeight : (source as HTMLImageElement).naturalHeight;
+
+    if (width > 0 && height > 0) {
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(source, 0, 0);
+          const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+          if (blob && blob.size > 100) return blob;
+        }
+      } catch {
+        // 若受瀏覽器限制則嘗試網路請求
       }
-    } catch {
-      // 若受瀏覽器跨域限制則嘗試網路請求
     }
   }
   if (!baseUrl) return null;
@@ -106,8 +122,23 @@ export async function playAudioOnChest(baseUrl: string, audioBlob: Blob): Promis
     const url = normalizeBaseUrl(baseUrl);
     const response = await fetch(`${url}/play`, {
       method: 'POST',
-      headers: { 'Content-Type': 'audio/wav' },
       body: audioBlob,
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 觸發胸前板內建蜂鳴/提示音 (/beep)
+ */
+export async function triggerChestBeep(baseUrl: string): Promise<boolean> {
+  try {
+    const url = normalizeBaseUrl(baseUrl);
+    const response = await fetch(`${url}/beep`, {
+      method: 'GET',
+      cache: 'no-store',
     });
     return response.ok;
   } catch {

@@ -8,6 +8,7 @@ mobile_app/.env.*.local
 compile_commands.json
 
 # Node / Vite / Capacitor generated files
+.tools/
 mobile_app/node_modules/
 mobile_app/dist/
 mobile_app/android/.gradle/
@@ -19,5 +20,7 @@ mobile_app/android/local.properties
 *.hex
 *.bin
 *.elf
+*.wav
+*.mp3
 .vscode/
 .DS_Store

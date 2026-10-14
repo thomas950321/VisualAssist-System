@@ -5,6 +5,7 @@ import {
   captureCurrentStreamFrame,
   fetchChestStatus,
   fetchLatestAudio,
+  triggerChestBeep,
   type ChestStatus,
 } from './services/cameraService';
 import {
@@ -37,20 +38,21 @@ interface ConversationItem {
 
 function App() {
   const [cameraUrl, setCameraUrl] = useState(() => {
+    const targetIp = 'http://172.18.71.134';
     const saved = localStorage.getItem(CAMERA_URL_STORAGE_KEY);
-    if (!saved || saved.includes('172.18.71.') || saved.includes('192.168.4.')) {
-      localStorage.setItem(CAMERA_URL_STORAGE_KEY, 'http://192.168.0.164');
-      return 'http://192.168.0.164';
+    if (!saved || saved.includes('192.168.0.164') || saved.includes('192.168.4.')) {
+      localStorage.setItem(CAMERA_URL_STORAGE_KEY, targetIp);
+      return targetIp;
     }
-    return saved;
+    return saved || targetIp;
   });
   
   // Layer 0: Chest Hardware Emergency Brake Telemetry
   const [chestTelemetry, setChestTelemetry] = useState<ChestTelemetry>(DEFAULT_CHEST_TELEMETRY);
   const [chestStatus, setChestStatus] = useState<ChestStatus | null>(null);
 
-  // Layer 1: Edge YOLO Detection State
-  const [trackingEnabled, setTrackingEnabled] = useState(true);
+  // Layer 1: Edge YOLO Detection State (預設暫停，避免自動持續分析)
+  const [trackingEnabled, setTrackingEnabled] = useState(false);
   const [detections, setDetections] = useState<Detection[]>([]);
   const edgeDetectorRef = useRef<LocalYoloEdgeDetector | null>(null);
   const lastSpokenThreatRef = useRef<{ label: string; threatLevel: ThreatLevel; timestamp: number }>({
@@ -69,10 +71,14 @@ function App() {
   const [isListening, setIsListening] = useState(false);
   const recognitionRef = useRef<any>(null);
 
-  // 實體按鍵與音訊計數器追蹤 (防重複觸發)
-  const lastTriggerCounterRef = useRef<number>(0);
-  const lastAudioCounterRef = useRef<number>(0);
+  // 實體按鍵與音訊計數器追蹤 (防重複觸發，-1 代表初次尚未同步)
+  const lastTriggerCounterRef = useRef<number>(-1);
+  const lastAudioCounterRef = useRef<number>(-1);
   const isHandlingVoiceRef = useRef<boolean>(false);
+
+  // ESP32 相機串流狀態
+  const [streamError, setStreamError] = useState<boolean>(false);
+  const [isReconnecting, setIsReconnecting] = useState<boolean>(false);
 
   // System States
   const [error, setError] = useState('');
@@ -81,6 +87,24 @@ function App() {
   const streamImgRef = useRef<HTMLImageElement | null>(null);
   const lastUrgentBrakeRef = useRef(false);
   const [isRealModel, setIsRealModel] = useState(false);
+
+  const applyCameraUrl = (url: string) => {
+    const normalized = url.trim().replace(/\/$/, '');
+    setCameraUrl(normalized);
+    localStorage.setItem(CAMERA_URL_STORAGE_KEY, normalized);
+    setStreamError(false);
+    setLastEvent(`已切換 ESP32 相機位址至：${normalized}`);
+  };
+
+  const reconnectStream = () => {
+    setIsReconnecting(true);
+    setStreamError(false);
+    if (streamImgRef.current) {
+      const base = cameraStreamUrl(cameraUrl);
+      streamImgRef.current.src = `${base}${base.includes('?') ? '&' : '?'}t=${Date.now()}`;
+    }
+    setTimeout(() => setIsReconnecting(false), 800);
+  };
 
   // 初始化第 1 層本地邊緣 YOLO 偵測器
   useEffect(() => {
@@ -129,7 +153,14 @@ function App() {
             if (isNewTarget || isEscalated || isLongIntervalRemind) {
               const distanceText = criticalInCenter.threatLevel === 'critical' ? '緊急靠近中' : '前方約三公尺';
               const message = `注意，正前方有${criticalInCenter.chineseLabel}，${distanceText}`;
-              speak(message, criticalInCenter.threatLevel === 'critical' ? 'urgent' : 'normal');
+              
+              if (useChestSpeaker && cameraUrl) {
+                // 優先由胸前板喇叭真人語音播報提醒，並輔以嗶聲
+                void triggerChestBeep(cameraUrl);
+                void speakResponse(message, cameraUrl, true, (msg) => setLastEvent(msg));
+              } else {
+                speak(message, criticalInCenter.threatLevel === 'critical' ? 'urgent' : 'normal');
+              }
 
               lastSpokenThreatRef.current = {
                 label: criticalInCenter.chineseLabel,
@@ -167,7 +198,7 @@ function App() {
     setLastEvent('🎙️ 接收到胸前麥克風提問！正在抓取照片與音訊送往 Gemini…');
 
     try {
-      // 1. 優先從目前畫面瞬間快照 (避免與 ESP32 MJPEG 串流連線搶佔卡死)，並同步抓取錄音檔
+      // 1. 優先從目前胸前板畫面瞬間快照 (避免與 ESP32 MJPEG 串流連線搶佔卡死)，並同步抓取錄音檔
       const image = await captureCurrentStreamFrame(streamImgRef.current, cameraUrl);
       const audio = await fetchLatestAudio(cameraUrl);
 
@@ -232,6 +263,9 @@ function App() {
       recognition.onresult = (event: any) => {
         const transcript = event.results?.[0]?.[0]?.transcript;
         if (transcript && transcript.trim()) {
+          // 辨識到一句話後立即關閉麥克風，絕不自動重複聆聽
+          try { recognition.stop(); } catch {}
+          setIsListening(false);
           setTextQuestion(transcript.trim());
           setLastEvent(`🎙️ 聽取到提問：「${transcript.trim()}」，正在分析畫面與回答…`);
           void describeEnvironment(transcript.trim());
@@ -240,9 +274,7 @@ function App() {
 
       recognition.onerror = (event: any) => {
         setIsListening(false);
-        if (event.error !== 'no-speech') {
-          setError(`語音辨識提示：${event.error}`);
-        }
+        try { recognition.stop(); } catch {}
       };
 
       recognition.onend = () => {
@@ -262,11 +294,10 @@ function App() {
     if (describing) return;
     setError('');
     setDescribing(true);
-    setLastEvent(customQuestion ? `正在向 Gemini 提問：「${customQuestion}」…` : '正在進行全景環境認知分析…');
     try {
       const image = await captureCurrentStreamFrame(streamImgRef.current, cameraUrl);
       if (!image && !customQuestion) {
-        throw new Error('相機尚未連線，無法取得畫面；請先在下方輸入相機位址或直接輸入文字提問。');
+        throw new Error('胸前 ESP32 相機尚未連線，無法取得畫面；請確認下方相機位址或先使用文字提問。');
       }
       const qaResult = customQuestion
         ? await askGeminiWithImageAndAudio(image, null, customQuestion)
@@ -324,38 +355,35 @@ function App() {
           lastUpdated: Date.now(),
         });
 
-        // 觸發急煞廣播
+        // 第 0 層急煞僅更新狀態與胸前板警示，不透過電腦喇叭持續轟炸播報
         if (emergencyBrake && !lastUrgentBrakeRef.current) {
-          speak('急煞警告！前方緊急近迫障礙物！', 'urgent');
           setLastEvent('第 0 層急煞：胸前硬體偵測距離小於 80cm！');
         }
         lastUrgentBrakeRef.current = emergencyBrake;
 
         // 偵測胸前板「按住提問錄音完畢放開」事件
-        if (
+        if (lastAudioCounterRef.current === -1 && status.audioCounter !== undefined) {
+          lastAudioCounterRef.current = status.audioCounter;
+        } else if (
           status.audioCounter !== undefined &&
-          lastAudioCounterRef.current > 0 &&
+          lastAudioCounterRef.current !== -1 &&
           status.audioCounter > lastAudioCounterRef.current
         ) {
           lastAudioCounterRef.current = status.audioCounter;
           lastTriggerCounterRef.current = status.triggerCounter;
           void handleChestVoiceQandA();
-        } else if (
-          status.triggerCounter !== undefined &&
-          lastTriggerCounterRef.current > 0 &&
-          status.triggerCounter > lastTriggerCounterRef.current
-        ) {
-          // 純短按拍照事件
-          lastTriggerCounterRef.current = status.triggerCounter;
-          void describeEnvironment();
         }
 
-        // 初次連線校正計數器基準點
-        if (lastTriggerCounterRef.current === 0 && status.triggerCounter !== undefined) {
+        // 偵測胸前板「短按拍照快門」事件
+        if (lastTriggerCounterRef.current === -1 && status.triggerCounter !== undefined) {
           lastTriggerCounterRef.current = status.triggerCounter;
-        }
-        if (lastAudioCounterRef.current === 0 && status.audioCounter !== undefined) {
-          lastAudioCounterRef.current = status.audioCounter;
+        } else if (
+          status.triggerCounter !== undefined &&
+          lastTriggerCounterRef.current !== -1 &&
+          status.triggerCounter > lastTriggerCounterRef.current
+        ) {
+          lastTriggerCounterRef.current = status.triggerCounter;
+          void describeEnvironment();
         }
       } catch {
         if (!isMounted) return;
@@ -400,6 +428,32 @@ function App() {
           <p className="subtitle">第0層胸前急煞 + 第1層手機本地YOLO動態追蹤 + 第2層按需雲端認知</p>
         </div>
         <div className="status-pill-group">
+          <button
+            type="button"
+            className="secondary btn-small"
+            style={{
+              background: '#991b1b',
+              color: '#ffffff',
+              border: '1px solid #dc2626',
+              fontWeight: 'bold',
+              cursor: 'pointer',
+              padding: '6px 12px',
+              borderRadius: '20px',
+            }}
+            onClick={() => {
+              setTrackingEnabled(false);
+              setDescribing(false);
+              isHandlingVoiceRef.current = false;
+              cancelSpeech();
+              if (recognitionRef.current) {
+                try { recognitionRef.current.stop(); } catch {}
+              }
+              setIsListening(false);
+              setLastEvent('⏹️ 已立即停止所有 YOLO 追蹤、雲端分析與語音！');
+            }}
+          >
+            ⏹️ 一鍵停止所有分析與語音
+          </button>
           <div className={`connection-pill ${chestTelemetry.connected ? 'online' : 'offline'}`}>
             <span className="status-dot" /> {chestTelemetry.connected ? '胸前相機已連線' : '胸前相機離線'}
           </div>
@@ -456,12 +510,48 @@ function App() {
               {cameraUrl ? (
                 <img
                   ref={streamImgRef}
+                  className="camera-stream"
                   src={cameraStreamUrl(cameraUrl)}
-                  alt="胸前相機即時畫面"
+                  alt="胸前 ESP32 即時畫面"
                   crossOrigin="anonymous"
+                  onLoad={() => setStreamError(false)}
+                  onError={() => setStreamError(true)}
                 />
               ) : (
-                <div className="empty-frame">請先輸入相機位址</div>
+                <div className="empty-frame">請先輸入 ESP32 相機位址</div>
+              )}
+
+              {streamError && (
+                <div className="camera-error-hint">
+                  <h4>⚠️ 尚未接收到 ESP32 相機串流 ({cameraUrl})</h4>
+                  <p>請確認 ESP32 的連線狀態：</p>
+                  <ul>
+                    <li><b>情況 A：ESP32 剛開機或尚未連上 Wi-Fi</b><br/>請將電腦 Wi-Fi 連線至 ESP32 熱點 <b>BlindAssist-Camera</b>（密碼: <b>blindassist</b>），並點擊下方 <b>192.168.4.1</b>。</li>
+                    <li><b>情況 B：ESP32 已連線至您的 Wi-Fi (00000000)</b><br/>請確認 ESP32 分配到的實際 IP（可從手機熱點連線裝置列表查看），並在下方直接填入連線。</li>
+                  </ul>
+                  <div className="quick-ip-buttons">
+                    <button className="primary btn-small" onClick={() => applyCameraUrl('http://172.18.71.134')}>
+                      🎯 立即連線 (172.18.71.134)
+                    </button>
+                    <button className="secondary btn-small" onClick={() => applyCameraUrl('http://192.168.4.1')}>
+                      📡 熱點 AP (192.168.4.1)
+                    </button>
+                    <button className="secondary btn-small" onClick={reconnectStream}>
+                      🔄 {isReconnecting ? '連線中…' : '重新整理影像串流'}
+                    </button>
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px', marginTop: '14px', justifyContent: 'center' }}>
+                    <input
+                      style={{ padding: '6px 10px', fontSize: '13px', width: '240px', borderRadius: '6px', background: '#0b1624', color: '#fff', border: '1px solid #32567a' }}
+                      value={cameraUrl}
+                      onChange={(e) => setCameraUrl(e.target.value)}
+                      placeholder="輸入 ESP32 IP，例如 http://192.168.43.50"
+                    />
+                    <button className="primary btn-small" onClick={() => applyCameraUrl(cameraUrl)}>
+                      儲存並連線
+                    </button>
+                  </div>
+                </div>
               )}
 
               {/* 疊加中央安全錐視覺標線 */}
@@ -508,9 +598,19 @@ function App() {
           <div className="button-row">
             <button
               className={trackingEnabled ? 'secondary' : 'primary'}
-              onClick={() => setTrackingEnabled((prev) => !prev)}
+              onClick={() => {
+                const nextState = !trackingEnabled;
+                setTrackingEnabled(nextState);
+                if (!nextState) {
+                  setDetections([]);
+                  cancelSpeech();
+                  setLastEvent('⏹️ 已暫停 YOLO 即時追蹤與警報語音');
+                } else {
+                  setLastEvent('▶️ 已啟動 YOLO 即時動態感知追蹤');
+                }
+              }}
             >
-              {trackingEnabled ? '暫停 YOLO 追蹤' : '啟動 YOLO 追蹤'}
+              {trackingEnabled ? '⏹️ 暫停 YOLO 追蹤' : '▶️ 啟動 YOLO 追蹤'}
             </button>
             <button
               className={`secondary ${demoMode ? 'selected' : ''}`}
@@ -553,11 +653,11 @@ function App() {
             本層專為讀取<strong>店家招牌、紅綠燈秒數、環境全景敘事與尋物</strong>設計。
           </p>
 
-          <div className="voice-tip-box">
-            <span className="voice-tip-icon">💡</span>
+          <div className="voice-tip-box" style={{ borderLeft: '4px solid #10b981', background: 'rgba(16, 185, 129, 0.1)' }}>
+            <span className="voice-tip-icon">🎯</span>
             <div className="voice-tip-text">
-              <strong>雙向語音互動模式：</strong>
-              您可以長按胸前板 <code>BOOT (GPIO 0)</code> 鍵說話提問，或點擊下方「免手按語音提問」直接開口。AI 會看眼前畫面並<strong>直接透過胸前板喇叭播放回答</strong>！
+              <strong>純按鍵觸發模式已生效：</strong>
+              系統平常保持完全靜態待命（絕對不會自動循環分析）。<strong>只有在您按住板子背後的 <code>BOOT (GPIO 0)</code> 鍵提問、放開後，AI 才會啟動分析一次並直接由胸前板喇叭回答！</strong>
             </div>
           </div>
 
@@ -578,6 +678,29 @@ function App() {
                 onClick={() => setUseChestSpeaker(false)}
               >
                 📱 手機/電腦喇叭
+              </button>
+              <button
+                type="button"
+                className="target-pill"
+                style={{ background: '#2563eb', color: '#ffffff', border: '1px solid #3b82f6', fontWeight: 'bold' }}
+                onClick={async () => {
+                  setLastEvent('🔊 正在發送嗶聲測試至胸前板喇叭…');
+                  const ok = await triggerChestBeep(cameraUrl);
+                  setLastEvent(ok ? '🔊 [測試成功] 胸前板喇叭已發出嗶聲提示！' : '❌ 胸前板喇叭無回應，請確認相機連線。');
+                }}
+              >
+                🎵 測試嗶聲
+              </button>
+              <button
+                type="button"
+                className="target-pill"
+                style={{ background: '#059669', color: '#ffffff', border: '1px solid #10b981', fontWeight: 'bold' }}
+                onClick={async () => {
+                  setLastEvent('🗣️ 正在合成語音並推播至胸前喇叭…');
+                  await speakResponse('視覺輔助系統已就緒，我可以為您報路', cameraUrl, true, (msg) => setLastEvent(msg));
+                }}
+              >
+                🗣️ 測試真人語音說話
               </button>
             </div>
 
@@ -639,11 +762,21 @@ function App() {
           </form>
 
           <button
-            className="secondary wide trigger-btn"
-            onClick={() => void describeEnvironment()}
-            disabled={describing || !cameraUrl}
+            className={`wide trigger-btn ${describing ? 'danger' : 'secondary'}`}
+            onClick={() => {
+              if (describing) {
+                setDescribing(false);
+                isHandlingVoiceRef.current = false;
+                cancelSpeech();
+                setLastEvent('⏹️ 已手動取消雲端分析');
+                return;
+              }
+              void describeEnvironment();
+            }}
+            disabled={!cameraUrl && !describing}
+            style={describing ? { background: '#dc2626', color: '#ffffff', borderColor: '#b91c1c', cursor: 'pointer' } : {}}
           >
-            {describing ? '雲端分析中，請稍候…' : '📷 單拍快門：解讀全景情境'}
+            {describing ? '⏹️ 雲端分析中… (點擊立即強制取消)' : '📷 單拍快門：解讀全景情境'}
           </button>
 
           {/* 最新提問與回答醒目焦點卡片 */}

@@ -21,8 +21,8 @@
 #include "soc/rtc_cntl_reg.h"
 #include "driver/i2s.h"
 
-const char* WIFI_SSID = "TP-Link_Kobe";
-const char* WIFI_PASSWORD = "0955062890";
+const char* WIFI_SSID = "00000000";
+const char* WIFI_PASSWORD = "00000001";
 const char* FALLBACK_AP_SSID = "BlindAssist-Camera";
 const char* FALLBACK_AP_PASSWORD = "blindassist";
 
@@ -73,6 +73,7 @@ static const char* STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" S
 static const char* STREAM_PART = "\r\n--" STREAM_BOUNDARY "\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 httpd_handle_t cameraHttpd = nullptr;
+httpd_handle_t streamHttpd = nullptr;
 volatile uint32_t triggerCounter = 0;
 uint32_t lastButtonChangeMs = 0;
 
@@ -265,6 +266,28 @@ static esp_err_t captureHandler(httpd_req_t* request) {
   return sendJpegFrame(request);
 }
 
+// ---------- 數位音訊前處理 (消除直流偏置 + 16 倍數位增益放大) ----------
+static void processAndBoostAudio(uint8_t* buffer, size_t bytes) {
+  if (!buffer || bytes < 4) return;
+  size_t numSamples = bytes / sizeof(int16_t);
+  int16_t* samples = (int16_t*)buffer;
+
+  int64_t sum = 0;
+  for (size_t i = 0; i < numSamples; i++) {
+    sum += samples[i];
+  }
+  int16_t dcOffset = (int16_t)(sum / numSamples);
+
+  const int gain = 16; // 數位音量放大 16 倍 (+24dB)
+  for (size_t i = 0; i < numSamples; i++) {
+    int32_t val = (int32_t)(samples[i] - dcOffset) * gain;
+    if (val > 32767) val = 32767;
+    else if (val < -32768) val = -32768;
+    samples[i] = (int16_t)val;
+  }
+  Serial.printf("[AUDIO] 🎙️ 音訊前處理完成: 消除 DC Offset (%d), 放大 16 倍，樣本數: %u\n", dcOffset, (unsigned int)numSamples);
+}
+
 static esp_err_t audioHandler(httpd_req_t* request) {
   addCorsHeaders(request);
   if (audioRecordedBytes == 0 || audioRecordBuffer == nullptr) {
@@ -296,6 +319,55 @@ static esp_err_t audioHandler(httpd_req_t* request) {
     httpd_resp_send_chunk(request, nullptr, 0); // 傳輸結束標記
   }
   return res;
+}
+
+// ---------- 喇叭正弦波音調產生器 (免檔案、直接驅動 MAX98357) ----------
+static void playTone(uint16_t freq, uint16_t durationMs) {
+  if (!speakerReady) return;
+  const uint32_t sampleRate = AUDIO_SAMPLE_RATE; // 16000
+  const size_t totalSamples = (sampleRate * durationMs) / 1000;
+  int16_t buffer[256 * 2]; // 立體聲雙聲道緩衝區 (LRCLK interleaved)
+  float phase = 0.0f;
+  const float phaseInc = 2.0f * 3.14159265f * freq / sampleRate;
+
+  size_t samplesRemaining = totalSamples;
+  while (samplesRemaining > 0) {
+    size_t chunk = min((size_t)256, samplesRemaining);
+    for (size_t i = 0; i < chunk; i++) {
+      int16_t sample = (int16_t)(sinf(phase) * 16000.0f);
+      phase += phaseInc;
+      if (phase >= 2.0f * 3.14159265f) phase -= 2.0f * 3.14159265f;
+      buffer[i * 2] = sample;     // 左聲道
+      buffer[i * 2 + 1] = sample; // 右聲道
+    }
+    size_t bytesWritten = 0;
+    i2s_write(I2S_NUM_1, buffer, chunk * sizeof(int16_t) * 2, &bytesWritten, portMAX_DELAY);
+    samplesRemaining -= chunk;
+  }
+}
+
+// 開機成功旋律 (Do-Mi-Sol)
+static void playStartupChime() {
+  Serial.println("[AUDIO] 🔊 播放開機提示旋律...");
+  playTone(523, 100); // C5
+  delay(20);
+  playTone(659, 100); // E5
+  delay(20);
+  playTone(784, 180); // G5
+}
+
+// 警報與按鍵提示音
+static void playAlertTone() {
+  playTone(1200, 80);
+  delay(30);
+  playTone(1600, 120);
+}
+
+static esp_err_t beepHandler(httpd_req_t* request) {
+  addCorsHeaders(request);
+  playAlertTone();
+  httpd_resp_set_type(request, "application/json; charset=utf-8");
+  return httpd_resp_send(request, "{\"status\":\"BEEP_OK\"}", HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t playHandler(httpd_req_t* request) {
@@ -341,6 +413,13 @@ static esp_err_t playHandler(httpd_req_t* request) {
 
   httpd_resp_set_type(request, "application/json; charset=utf-8");
   return httpd_resp_send(request, "{\"status\":\"PLAY_COMPLETED\"}", HTTPD_RESP_USE_STRLEN);
+}
+
+// 支援瀏覽器 CORS Preflight (OPTIONS /play)
+static esp_err_t optionsHandler(httpd_req_t* request) {
+  addCorsHeaders(request);
+  httpd_resp_set_status(request, "200 OK");
+  return httpd_resp_send(request, nullptr, 0);
 }
 
 static esp_err_t statusHandler(httpd_req_t* request) {
@@ -389,28 +468,49 @@ static esp_err_t statusHandler(httpd_req_t* request) {
 }
 
 static void startCameraServer() {
+  // 1. Port 80: 控制、語音收音 (/audio)、語音播放 (/play)、狀態與拍照端點
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
-  config.max_uri_handlers = 8;
+  config.ctrl_port = 32768;
+  config.max_uri_handlers = 10;
   config.max_open_sockets = 7;
   config.lru_purge_enable = true;
 
-  httpd_uri_t streamUri = { .uri = "/", .method = HTTP_GET, .handler = streamHandler, .user_ctx = nullptr };
   httpd_uri_t captureUri = { .uri = "/capture", .method = HTTP_GET, .handler = captureHandler, .user_ctx = nullptr };
   httpd_uri_t audioUri = { .uri = "/audio", .method = HTTP_GET, .handler = audioHandler, .user_ctx = nullptr };
   httpd_uri_t playUri = { .uri = "/play", .method = HTTP_POST, .handler = playHandler, .user_ctx = nullptr };
+  httpd_uri_t playOptionsUri = { .uri = "/play", .method = HTTP_OPTIONS, .handler = optionsHandler, .user_ctx = nullptr };
+  httpd_uri_t beepUri = { .uri = "/beep", .method = HTTP_GET, .handler = beepHandler, .user_ctx = nullptr };
   httpd_uri_t statusUri = { .uri = "/status", .method = HTTP_GET, .handler = statusHandler, .user_ctx = nullptr };
 
   esp_err_t serverErr = httpd_start(&cameraHttpd, &config);
   if (serverErr == ESP_OK) {
-    httpd_register_uri_handler(cameraHttpd, &streamUri);
     httpd_register_uri_handler(cameraHttpd, &captureUri);
     httpd_register_uri_handler(cameraHttpd, &audioUri);
     httpd_register_uri_handler(cameraHttpd, &playUri);
+    httpd_register_uri_handler(cameraHttpd, &playOptionsUri);
+    httpd_register_uri_handler(cameraHttpd, &beepUri);
     httpd_register_uri_handler(cameraHttpd, &statusUri);
-    Serial.println("[OK] Camera & Voice HTTP 伺服器啟動成功，支援端點: /, /capture, /audio, /play, /status");
+    Serial.println("[OK] Port 80 控制端點啟動成功: /capture, /audio, /play, /beep, /status");
   } else {
-    Serial.printf("[ERROR] HTTP 伺服器啟動失敗 (錯誤代碼: 0x%x)！Port 80 可能已被佔用或記憶體不足。\n", serverErr);
+    Serial.printf("[ERROR] Port 80 HTTP 伺服器啟動失敗 (0x%x)\n", serverErr);
+  }
+
+  // 2. Port 81: 獨立影像串流專用伺服器 (避免阻塞語音與狀態端點)
+  httpd_config_t streamConfig = HTTPD_DEFAULT_CONFIG();
+  streamConfig.server_port = 81;
+  streamConfig.ctrl_port = 32769;
+  streamConfig.max_uri_handlers = 2;
+  streamConfig.max_open_sockets = 4;
+  streamConfig.lru_purge_enable = true;
+
+  httpd_uri_t streamUri = { .uri = "/", .method = HTTP_GET, .handler = streamHandler, .user_ctx = nullptr };
+  esp_err_t streamErr = httpd_start(&streamHttpd, &streamConfig);
+  if (streamErr == ESP_OK) {
+    httpd_register_uri_handler(streamHttpd, &streamUri);
+    Serial.println("[OK] Port 81 MJPEG 影像串流伺服器啟動成功");
+  } else {
+    Serial.printf("[ERROR] Port 81 串流伺服器啟動失敗 (0x%x)\n", streamErr);
   }
 }
 
@@ -711,6 +811,9 @@ void setup() {
   connectWiFi();
   startCameraServer();
 
+  // 6. 開機成功提示旋律 (Do-Mi-Sol)
+  playStartupChime();
+
   Serial.println("[OK] 第 0 層硬體急煞守護已就緒 (< 80cm 自動警報，取樣週期 25ms)。");
   Serial.println("[OK] 對胸前提問語音互動已就緒 (長按按鈕 > 350ms 錄音提問，放開自動拍照問答)。");
 }
@@ -734,6 +837,7 @@ void loop() {
         isRecording = true;
         audioRecordedBytes = 0;
         digitalWrite(BRAKE_ALARM_PIN, HIGH); // 錄音指示燈恆亮
+        playTone(800, 70); // 提問收音開始提示音
         Serial.println("[AUDIO] 🎙️ 進入按住說話錄音提問模式...");
       }
 
@@ -750,6 +854,8 @@ void loop() {
           // 達到最大長度上限 (6秒)，自動結束錄音與拍照
           isRecording = false;
           digitalWrite(BRAKE_ALARM_PIN, LOW);
+          processAndBoostAudio(audioRecordBuffer, audioRecordedBytes);
+          playTone(1500, 80);
           audioCounter++;
           triggerCounter++;
           Serial.printf("[AUDIO] 🛑 錄音已達 6 秒上限，自動結束！bytes: %lu, audioCounter=%lu\n",
@@ -763,6 +869,8 @@ void loop() {
         if (isRecording) {
           isRecording = false;
           digitalWrite(BRAKE_ALARM_PIN, LOW);
+          processAndBoostAudio(audioRecordBuffer, audioRecordedBytes);
+          playTone(1500, 80);
           audioCounter++;
           triggerCounter++;
         }
@@ -774,9 +882,11 @@ void loop() {
     if (buttonHeld) {
       const uint32_t pressDuration = now - buttonPressStartMs;
       if (isRecording) {
-        // 錄音提問結束：放開按鈕自動拍照並送出問答
+        // 錄音提問結束：放開按鈕自動進行音訊前處理 (去偏置+放大)、拍照並送出問答
         isRecording = false;
         digitalWrite(BRAKE_ALARM_PIN, LOW);
+        processAndBoostAudio(audioRecordBuffer, audioRecordedBytes);
+        playTone(1500, 80); // 提問收音結束提示音
         audioCounter++;
         triggerCounter++; // 同時遞增 triggerCounter 進行拍照
         Serial.printf("[AUDIO] 🛑 錄音提問結束！收音長度: %lu bytes, audioCounter=%lu, 同步觸發拍照問答。\n",
@@ -786,6 +896,7 @@ void loop() {
         // 短按 (< 350ms): 純手動拍照快門
         lastButtonChangeMs = now;
         triggerCounter++;
+        playTone(1200, 50); // 快門提示音
         Serial.printf("[TRIGGER] 📸 實體按鍵短按觸發拍照: %lu; 手機將抓取 /capture。\n",
                       static_cast<unsigned long>(triggerCounter));
       }
