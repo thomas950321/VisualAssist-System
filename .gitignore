@@ -22,5 +22,6 @@ mobile_app/android/local.properties
 *.elf
 *.wav
 *.mp3
+*.jpg
 .vscode/
 .DS_Store

@@ -78,6 +78,9 @@ function App() {
   const describingRef = useRef<boolean>(false);
   const analysisGenerationRef = useRef<number>(0);
   const inferenceInFlightRef = useRef<boolean>(false);
+  // 語音播放冷卻期：防止喇叭聲音被麥克風收音觸發回饋循環
+  const systemSpeakingRef = useRef<boolean>(false);
+  const playbackCooldownUntilRef = useRef<number>(0);
 
   // ESP32 相機串流狀態
   const [streamError, setStreamError] = useState<boolean>(false);
@@ -90,6 +93,10 @@ function App() {
   const streamImgRef = useRef<HTMLImageElement | null>(null);
   const lastUrgentBrakeRef = useRef(false);
   const [isRealModel, setIsRealModel] = useState(false);
+  const [lastInferenceMs, setLastInferenceMs] = useState(0);
+
+  // 推論輪詢間隔 (ms)：預設 60ms ≈ 16 FPS，可根據裝置效能調整
+  const INFERENCE_INTERVAL_MS = 60;
 
   const applyCameraUrl = (url: string) => {
     const normalized = url.trim().replace(/\/$/, '');
@@ -141,6 +148,10 @@ function App() {
           const results = await detector.detect(img, demoMode);
           setDetections(results);
 
+          // 記錄推論耗時，供 UI 顯示效能資訊
+          const inferMs = detector.getLastInferenceMs();
+          if (inferMs > 0) setLastInferenceMs(inferMs);
+
           // 空間安全錐危險過濾 (僅針對中央安全錐之 warning / critical 目標)
           const criticalInCenter = results.find(
             (item) => item.zone === 'center' && (item.threatLevel === 'critical' || item.threatLevel === 'warning')
@@ -163,7 +174,7 @@ function App() {
               if (useChestSpeaker && cameraUrl) {
                 // 優先由胸前板喇叭真人語音播報提醒，並輔以嗶聲
                 void triggerChestBeep(cameraUrl);
-                void speakResponse(message, cameraUrl, true, (msg) => setLastEvent(msg));
+                speakWithCooldown(message, true, (msg) => setLastEvent(msg));
               } else {
                 speak(message, criticalInCenter.threatLevel === 'critical' ? 'urgent' : 'normal');
               }
@@ -186,13 +197,18 @@ function App() {
               };
             }
           }
-        } catch {
-          // 推論暫態忽略
+        } catch (e) {
+          // 推論暫態忽略：若為 CORS 或 canvas 污染錯誤，提醒用戶檢查 ESP32 相機跨域設定
+          const msg = String(e ?? '');
+          if (msg.includes('security') || msg.includes('tainted') || msg.includes('cross-origin') || msg.includes('CORS')) {
+            setStreamError(true);
+            setLastEvent('⚠️ ESP32 相機串流跨域 (CORS) 受限，YOLO 無法讀取畫面像素。請確認 ESP32 已允許跨域存取，或改用 localhost 測試。');
+          }
         } finally {
           inferenceInFlightRef.current = false;
         }
       }
-    }, 90);
+    }, INFERENCE_INTERVAL_MS);
 
     return () => window.clearInterval(interval);
   }, [trackingEnabled, demoMode, cameraUrl, useChestSpeaker]);
@@ -200,6 +216,13 @@ function App() {
   // 第 2 層：胸前雙向語音提問處理核心
   async function handleChestVoiceQandA() {
     if (isHandlingVoiceRef.current) return;
+    // 冷卻期內禁止觸發新語音問答（防止喇叭聲音被收音觸發回饋循環）
+    const nowMs = Date.now();
+    if (nowMs < playbackCooldownUntilRef.current) {
+      const remainingSec = Math.ceil((playbackCooldownUntilRef.current - nowMs) / 1000);
+      setLastEvent(`⏸️ 系統語音冷卻中（剩餘 ${remainingSec} 秒），請稍後再提問`);
+      return;
+    }
     isHandlingVoiceRef.current = true;
     const generation = ++analysisGenerationRef.current;
     setDescribing(true);
@@ -218,7 +241,7 @@ function App() {
       if (generation !== analysisGenerationRef.current) return;
       
       // 3. 語音朗讀回答 (優先推播至 ESP32 胸前板喇叭，失敗時本機發聲)
-      void speakResponse(qaResult.answer, cameraUrl, useChestSpeaker, (s) => setLastEvent(s));
+      speakWithCooldown(qaResult.answer, useChestSpeaker, (s) => setLastEvent(s));
 
       // 4. 更新對話與紀錄 (將使用者問的話清楚呈現於畫面上)
       const newEntry: ConversationItem = {
@@ -253,6 +276,14 @@ function App() {
       }
       setIsListening(false);
       setLastEvent('已關閉免手按語音聆聽');
+      return;
+    }
+
+    // 冷卻期內禁止開啟聆聽（防止喇叭聲音被收音觸發回饋循環）
+    const nowMs = Date.now();
+    if (nowMs < playbackCooldownUntilRef.current) {
+      const remainingSec = Math.ceil((playbackCooldownUntilRef.current - nowMs) / 1000);
+      setError(`系統語音播放中，請等待 ${remainingSec} 秒後再開啟聆聽`);
       return;
     }
 
@@ -326,7 +357,7 @@ function App() {
       setDescription(nextDescription);
 
       // 智慧語音輸出：優先推播給 ESP32 胸前板喇叭播放
-      void speakResponse(qaResult.answer, cameraUrl, useChestSpeaker, (s) => setLastEvent(s));
+      speakWithCooldown(qaResult.answer, useChestSpeaker, (s) => setLastEvent(s));
 
       const newEntry: ConversationItem = {
         id: String(Date.now()),
@@ -438,7 +469,22 @@ function App() {
 
   function stopAllSpeech() {
     cancelSpeech();
+    systemSpeakingRef.current = false;
+    playbackCooldownUntilRef.current = 0;
     setLastEvent('已停止所有語音播報');
+  }
+
+  // 統一語音播放包裝：播放時設置系統說話狀態，播放後啟動冷卻期防止回饋循環
+  function speakWithCooldown(text: string, useChest: boolean, onStatus?: (msg: string) => void) {
+    systemSpeakingRef.current = true;
+    // 估計播放時間：中文每秒約 4-5 字，加上 2 秒緩衝
+    const estimatedPlayMs = Math.max(3000, text.length * 250 + 2000);
+    playbackCooldownUntilRef.current = Date.now() + estimatedPlayMs;
+    void speakResponse(text, cameraUrl, useChest, (msg) => {
+      onStatus?.(msg);
+      // 播放結束後稍後清除系統說話狀態
+      setTimeout(() => { systemSpeakingRef.current = false; }, 500);
+    });
   }
 
   return (
@@ -520,6 +566,11 @@ function App() {
                 {isRealModel ? '⚡ ONNX WebGL' : '🛠️ 模擬備援'}
               </span>
               <span className="tag">MJPEG</span>
+              {trackingEnabled && lastInferenceMs > 0 && (
+                <span className="tag" style={{ fontSize: '11px' }}>
+                  ⏱️ {lastInferenceMs.toFixed(0)}ms
+                </span>
+              )}
             </div>
           </div>
 
@@ -722,7 +773,7 @@ function App() {
                 style={{ background: '#059669', color: '#ffffff', border: '1px solid #10b981', fontWeight: 'bold' }}
                 onClick={async () => {
                   setLastEvent('🗣️ 正在合成語音並推播至胸前喇叭…');
-                  await speakResponse('視覺輔助系統已就緒，我可以為您報路', cameraUrl, true, (msg) => setLastEvent(msg));
+                  speakWithCooldown('視覺輔助系統已就緒，我可以為您報路', true, (msg) => setLastEvent(msg));
                 }}
               >
                 🗣️ 測試真人語音說話

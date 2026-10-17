@@ -133,6 +133,19 @@ export class LocalYoloEdgeDetector implements EdgeDetector {
   private offscreenCtx: CanvasRenderingContext2D | null = null;
   private demoIndex = 0;
 
+  // 記錄實際的 ONNX 張量名稱與輸出佈局，避免預設名稱 ('images' / 'output0') 與模型不符
+  private inputName = '';
+  private outputName = '';
+  // 'classes_first' => [1, 84, 8400]；'anchors_first' => [1, 8400, 84]
+  private outputLayout: 'classes_first' | 'anchors_first' = 'classes_first';
+
+  // 上一次真實推論的耗時 (毫秒)，供 UI 顯示效能資訊
+  private lastInferenceMs = 0;
+
+  public getLastInferenceMs(): number {
+    return this.lastInferenceMs;
+  }
+
   private readonly MODEL_PATH = '/models/yolov8n.onnx';
   private readonly INPUT_SIZE = 640;
   private readonly CONFIDENCE_THRESHOLD = 0.45;
@@ -151,7 +164,27 @@ export class LocalYoloEdgeDetector implements EdgeDetector {
       });
 
       this.realModelLoaded = true;
-      console.log('[YOLO Edge] ✓ 成功載入 YOLOv8n ONNX 模型，已啟用 WebGL/WASM 邊緣硬體加速！');
+
+      // 記錄實際的輸入/輸出張量名稱，避免預設名稱 ('images' / 'output0') 與模型不符
+      this.inputName = this.session.inputNames[0] || 'images';
+      this.outputName = this.session.outputNames[0] || 'output0';
+
+      // 嘗試從輸出張量形狀推斷 YOLOv8 輸出佈局
+      // YOLOv8n 輸出通常為 [1, 84, 8400] (classes_first) 或 [1, 8400, 84] (anchors_first)
+      const outputMeta = this.session.outputs[0];
+      if (outputMeta && outputMeta.dimensions) {
+        const dims = outputMeta.dimensions as number[];
+        if (dims.length === 3 && dims[1] === 8400 && dims[2] === 84) {
+          this.outputLayout = 'anchors_first';
+        } else if (dims.length === 3 && dims[1] === 84 && dims[2] === 8400) {
+          this.outputLayout = 'classes_first';
+        }
+      }
+
+      console.log(
+        `[YOLO Edge] ✓ 成功載入 YOLOv8n ONNX 模型，已啟用 WebGL/WASM 邊緣硬體加速！` +
+        ` (input=${this.inputName}, output=${this.outputName}, layout=${this.outputLayout})`
+      );
     } catch (err) {
       this.realModelLoaded = false;
       this.session = null;
@@ -219,21 +252,31 @@ export class LocalYoloEdgeDetector implements EdgeDetector {
 
     const inputTensor = new ort.Tensor('float32', float32Data, [1, 3, this.INPUT_SIZE, this.INPUT_SIZE]);
     const feeds: Record<string, ort.Tensor> = {};
-    const inputName = this.session.inputNames[0] || 'images';
-    feeds[inputName] = inputTensor;
+    feeds[this.inputName] = inputTensor;
 
     // 執行推論
+    const inferStart = performance.now();
     const results = await this.session.run(feeds);
-    const outputName = this.session.outputNames[0] || 'output0';
-    const outputTensor = results[outputName];
+    const outputTensor = results[this.outputName];
+    if (!outputTensor) {
+      console.warn(
+        `[YOLO Edge] 輸出張量名稱 "${this.outputName}" 與模型不符，可用輸出：${
+          this.session?.outputNames.join(', ') || '(未知)'
+        }`
+      );
+      return [];
+    }
 
-    // YOLOv8 輸出格式通常為 [1, 84, 8400]
-    // 84 = [cx, cy, w, h, class_0_prob, ... class_79_prob]
+    this.lastInferenceMs = performance.now() - inferStart;
+
     return this.postProcessYoloV8(outputTensor.data as Float32Array);
   }
 
   /**
    * YOLOv8 輸出張量後處理 (解析 Bbox、類別與 NMS)
+   * 支援兩種輸出佈局：
+   *   classes_first => [1, 84, 8400]：維度順為 [cx,cy,w,h, class_0...class_79]
+   *   anchors_first => [1, 8400, 84]：每個錨點 84 個數值，[cx,cy,w,h, class_0...class_79]
    */
   private postProcessYoloV8(output: Float32Array): Detection[] {
     const numAnchors = 8400;
@@ -244,14 +287,29 @@ export class LocalYoloEdgeDetector implements EdgeDetector {
       bbox: [number, number, number, number];
     }> = [];
 
+    // 根據輸出佈局決定索引計算方式
+    const getBboxValue = (i: number, dim: 0 | 1 | 2 | 3): number => {
+      const idx =
+        this.outputLayout === 'anchors_first'
+          ? i * (numClasses + 4) + dim
+          : dim * numAnchors + i;
+      return output[idx];
+    };
+    const getClassScore = (i: number, c: number): number => {
+      const idx =
+        this.outputLayout === 'anchors_first'
+          ? i * (numClasses + 4) + 4 + c
+          : (4 + c) * numAnchors + i;
+      return output[idx];
+    };
+
     // 解析每個候選預測
     for (let i = 0; i < numAnchors; i++) {
       let maxScore = 0;
       let maxClassId = -1;
 
       for (let c = 0; c < numClasses; c++) {
-        // output[ (4 + c) * numAnchors + i ]
-        const score = output[(4 + c) * numAnchors + i];
+        const score = getClassScore(i, c);
         if (score > maxScore) {
           maxScore = score;
           maxClassId = c;
@@ -265,10 +323,10 @@ export class LocalYoloEdgeDetector implements EdgeDetector {
         if (!NAVIGATION_RELEVANT_CLASSES.has(rawLabel)) continue;
 
         // 取得中心點與寬高 (原尺度 640x640)
-        const cx = output[0 * numAnchors + i];
-        const cy = output[1 * numAnchors + i];
-        const w = output[2 * numAnchors + i];
-        const h = output[3 * numAnchors + i];
+        const cx = getBboxValue(i, 0);
+        const cy = getBboxValue(i, 1);
+        const w = getBboxValue(i, 2);
+        const h = getBboxValue(i, 3);
 
         // 轉為正規化 [x, y, w, h] (0.0 ~ 1.0)
         const xNorm = Math.max(0, (cx - w / 2) / this.INPUT_SIZE);

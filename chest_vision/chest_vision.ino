@@ -98,8 +98,15 @@ volatile uint32_t audioCounter = 0;
 bool micReady = false;
 bool speakerReady = false;
 volatile bool audioPlaybackBusy = false;
+volatile bool audioPlaybackActive = false;
+uint32_t playbackEndTimeMs = 0;
+const uint32_t PLAYBACK_COOLDOWN_MS = 3000; // 喇叭播放結束後 3 秒內禁止錄音，防止回饋循環
 uint32_t buttonPressStartMs = 0;
 bool buttonHeld = false;
+bool buttonLockout = false; // 7秒安全機制觸發後鎖定，直到按鈕真正放開
+uint32_t lastDebounceMs = 0;
+bool lastRawButtonState = HIGH;
+const uint32_t DEBOUNCE_MS = 50; // 按鍵消抖時間
 
 struct __attribute__((packed)) WavHeader {
   char riff[4] = {'R', 'I', 'F', 'F'};
@@ -267,26 +274,52 @@ static esp_err_t captureHandler(httpd_req_t* request) {
   return sendJpegFrame(request);
 }
 
-// ---------- 數位音訊前處理 (消除直流偏置 + 16 倍數位增益放大) ----------
+// ---------- 數位音訊前處理 (消除直流偏置 + 自適應增益 + VAD 語音活動檢測) ----------
 static void processAndBoostAudio(uint8_t* buffer, size_t bytes) {
   if (!buffer || bytes < 4) return;
   size_t numSamples = bytes / sizeof(int16_t);
   int16_t* samples = (int16_t*)buffer;
 
   int64_t sum = 0;
+  int64_t sumSquares = 0;
   for (size_t i = 0; i < numSamples; i++) {
     sum += samples[i];
+    sumSquares += (int64_t)samples[i] * samples[i];
   }
   int16_t dcOffset = (int16_t)(sum / numSamples);
 
-  const int gain = 16; // 數位音量放大 16 倍 (+24dB)
+  // 計算 RMS 能量（去除直流偏置後）
+  double meanSquare = (double)(sumSquares / numSamples) - (double)dcOffset * dcOffset;
+  if (meanSquare < 0) meanSquare = 0;
+  double rms = sqrt(meanSquare);
+
+  // VAD：RMS 能量低於門檻時判定為雜訊/靜音，不進行放大（避免送出無意義音訊給 Gemini）
+  // 門檻設為 30：人聲即使偏小（RMS 30~80）仍放大 8 倍，確保 Gemini 轉寫得到足夠音量
+  const double VAD_RMS_THRESHOLD = 30.0;
+  if (rms < VAD_RMS_THRESHOLD) {
+    Serial.printf("[AUDIO] 🔇 VAD 判定為雜訊/靜音 (RMS: %.1f < %.1f)，跳過放大，樣本數: %u\n",
+                  rms, VAD_RMS_THRESHOLD, (unsigned int)numSamples);
+    return;
+  }
+
+  // 自適應增益：根據 RMS 動態調整，最大 8 倍，避免過度放大導致失真
+  int gain;
+  if (rms > 3000) {
+    gain = 2; // 已經夠大聲，只需微幅放大
+  } else if (rms > 1000) {
+    gain = 4;
+  } else {
+    gain = 8; // 較小的聲音才放大 8 倍
+  }
+
   for (size_t i = 0; i < numSamples; i++) {
     int32_t val = (int32_t)(samples[i] - dcOffset) * gain;
     if (val > 32767) val = 32767;
     else if (val < -32768) val = -32768;
     samples[i] = (int16_t)val;
   }
-  Serial.printf("[AUDIO] 🎙️ 音訊前處理完成: 消除 DC Offset (%d), 放大 16 倍，樣本數: %u\n", dcOffset, (unsigned int)numSamples);
+  Serial.printf("[AUDIO] 🎙️ 音訊前處理完成: 消除 DC Offset (%d), 自適應增益 %d 倍, RMS: %.1f, 樣本數: %u\n",
+                dcOffset, gain, rms, (unsigned int)numSamples);
 }
 
 static esp_err_t audioHandler(httpd_req_t* request) {
@@ -395,6 +428,9 @@ static esp_err_t playHandler(httpd_req_t* request) {
     return httpd_resp_send(request, "{\"error\":\"AUDIO_PLAYBACK_BUSY\"}", HTTPD_RESP_USE_STRLEN);
   }
 
+  // 標記喇叭播放中，防止麥克風在此期間收音觸發回饋循環
+  audioPlaybackActive = true;
+
   char buf[1024];
   int curLen = 0;
   uint8_t wavHeader[44] = {};
@@ -445,6 +481,8 @@ static esp_err_t playHandler(httpd_req_t* request) {
   }
 
   audioPlaybackBusy = false;
+  audioPlaybackActive = false;
+  playbackEndTimeMs = millis(); // 記錄播放結束時間，啟動冷卻期
 
   httpd_resp_set_type(request, "application/json; charset=utf-8");
   return httpd_resp_send(request, "{\"status\":\"PLAY_COMPLETED\"}", HTTPD_RESP_USE_STRLEN);
@@ -856,34 +894,89 @@ void setup() {
 void loop() {
   updateLayer0EmergencyBrake();
 
-  const bool pressed = (digitalRead(TRIGGER_BUTTON_PIN) == LOW);
   const uint32_t now = millis();
+
+  // 按鍵消抖處理：避免電氣噪聲或彈跳造成誤觸發
+  const bool rawPressed = (digitalRead(TRIGGER_BUTTON_PIN) == LOW);
+  if (rawPressed != lastRawButtonState) {
+    lastDebounceMs = now;
+  }
+  bool pressed = false;
+  if (now - lastDebounceMs > DEBOUNCE_MS) {
+    pressed = rawPressed;
+  }
+  lastRawButtonState = rawPressed;
+
+  // 診斷：每 2 秒輸出一次按鈕狀態（方便確認 GPIO 0 是否正常）
+  static uint32_t lastDebugMs = 0;
+  if (now - lastDebugMs > 2000) {
+    lastDebugMs = now;
+    Serial.printf("[DEBUG] GPIO0=%d, rawPressed=%d, pressed=%d, buttonHeld=%d, buttonLockout=%d, micReady=%s, audioPlaybackActive=%s\n",
+                  digitalRead(TRIGGER_BUTTON_PIN),
+                  rawPressed ? 1 : 0,
+                  pressed ? 1 : 0,
+                  buttonHeld ? 1 : 0,
+                  buttonLockout ? 1 : 0,
+                  micReady ? "true" : "false",
+                  audioPlaybackActive ? "true" : "false");
+  }
+
+  // 按鍵放開時解除鎖定
+  if (!pressed && buttonLockout) {
+    buttonLockout = false;
+    Serial.println("[BUTTON] 🔓 按鈕已放開，解除鎖定");
+  }
 
   // 按鍵按下處理
   if (pressed) {
-    if (!buttonHeld) {
+    // 鎖定狀態下忽略所有觸發（防止 7 秒安全機制無限循環）
+    if (buttonLockout) {
+      // 不做任何事，等待按鈕放開
+    } else if (!buttonHeld) {
       buttonHeld = true;
       buttonPressStartMs = now;
+      Serial.printf("[BUTTON] 🔘 按鈕按下 (holdTime=0, micReady=%s, audioPlaybackActive=%s, cooldown=%ums)\n",
+                    micReady ? "true" : "false",
+                    audioPlaybackActive ? "true" : "false",
+                    (unsigned int)(now - playbackEndTimeMs));
     } else {
       const uint32_t holdTime = now - buttonPressStartMs;
 
       // 按住超過 350ms: 進入對話提問錄音模式
       if (!isRecording && holdTime > 350) {
-        isRecording = true;
-        audioRecordedBytes = 0;
-        // 丟棄按鍵前殘留的 DMA 資料，確保 /audio 只包含本次提問。
-        if (micReady) {
-          i2s_zero_dma_buffer(I2S_NUM_0);
-          i2s_start(I2S_NUM_0);
+        Serial.printf("[BUTTON] ⏱️ 按住超過 350ms (holdTime=%ums, micReady=%s, audioPlaybackActive=%s, cooldownRemaining=%ums)\n",
+                      (unsigned int)holdTime,
+                      micReady ? "true" : "false",
+                      audioPlaybackActive ? "true" : "false",
+                      (millis() - playbackEndTimeMs < PLAYBACK_COOLDOWN_MS) ? (unsigned int)(PLAYBACK_COOLDOWN_MS - (millis() - playbackEndTimeMs)) : 0);
+        // 防止回饋循環：喇叭播放中或冷卻期內不啟動錄音
+        if (audioPlaybackActive) {
+          Serial.println("[AUDIO] ⏸️ 喇叭播放中，忽略錄音觸發（防止回饋循環）");
+        } else if (playbackEndTimeMs != 0 && millis() - playbackEndTimeMs < PLAYBACK_COOLDOWN_MS) {
+          Serial.printf("[AUDIO] ⏸️ 喇叭冷卻期內 (< %u ms)，忽略錄音觸發\n", PLAYBACK_COOLDOWN_MS);
+        } else {
+          isRecording = true;
+          audioRecordedBytes = 0;
+          // 丟棄按鍵前殘留的 DMA 資料，確保 /audio 只包含本次提問。
+          if (micReady) {
+            i2s_zero_dma_buffer(I2S_NUM_0);
+            i2s_start(I2S_NUM_0);
+          }
+          digitalWrite(BRAKE_ALARM_PIN, HIGH); // 錄音指示燈恆亮
+          playTone(800, 70); // 提問收音開始提示音
+          Serial.println("[AUDIO] 🎙️ 進入按住說話錄音提問模式...");
         }
-        digitalWrite(BRAKE_ALARM_PIN, HIGH); // 錄音指示燈恆亮
-        playTone(800, 70); // 提問收音開始提示音
-        Serial.println("[AUDIO] 🎙️ 進入按住說話錄音提問模式...");
       }
 
       // 正在錄音中：持續從 I2S PDM 麥克風讀取音訊
       if (isRecording && audioRecordBuffer && micReady) {
-        if (audioRecordedBytes < AUDIO_BUFFER_SIZE) {
+        // 若喇叭開始播放（AI 回答），立即停止錄音避免收到喇叭聲音
+        if (audioPlaybackActive) {
+          isRecording = false;
+          digitalWrite(BRAKE_ALARM_PIN, LOW);
+          if (micReady) i2s_stop(I2S_NUM_0);
+          Serial.println("[AUDIO] ⏸️ 喇叭播放中，自動停止錄音");
+        } else if (audioRecordedBytes < AUDIO_BUFFER_SIZE) {
           size_t bytesRead = 0;
           size_t bytesToRead = min((size_t)1024, (size_t)(AUDIO_BUFFER_SIZE - audioRecordedBytes));
           esp_err_t r = i2s_read(I2S_NUM_0, audioRecordBuffer + audioRecordedBytes, bytesToRead, &bytesRead, pdMS_TO_TICKS(10));
@@ -894,6 +987,7 @@ void loop() {
           // 達到最大長度上限 (6秒)，自動結束錄音與拍照
           isRecording = false;
           digitalWrite(BRAKE_ALARM_PIN, LOW);
+          if (micReady) i2s_stop(I2S_NUM_0);
           processAndBoostAudio(audioRecordBuffer, audioRecordedBytes);
           playTone(1500, 80);
           audioCounter++;
@@ -904,17 +998,20 @@ void loop() {
         }
       }
 
-      // 安全機制：若按鍵長按超過 7 秒（可能為腳位懸空或開機誤觸），自動重設按鍵狀態防止卡死
+      // 安全機制：若按鍵長按超過 7 秒（可能為腳位懸空或開機誤觸），鎖定按鈕直到放開
       if (holdTime > 7000) {
         if (isRecording) {
           isRecording = false;
           digitalWrite(BRAKE_ALARM_PIN, LOW);
+          if (micReady) i2s_stop(I2S_NUM_0);
           processAndBoostAudio(audioRecordBuffer, audioRecordedBytes);
           playTone(1500, 80);
           audioCounter++;
           triggerCounter++;
         }
-        buttonHeld = false; // 解除長按狀態
+        buttonHeld = false;
+        buttonLockout = true; // 鎖定按鈕，直到真正放開為止
+        Serial.println("[BUTTON] 🔒 按鍵長按超過 7 秒，鎖定按鈕直到放開（防止無限循環嗶叫）");
       }
     }
   } else {
@@ -925,6 +1022,7 @@ void loop() {
         // 錄音提問結束：放開按鈕自動進行音訊前處理 (去偏置+放大)、拍照並送出問答
         isRecording = false;
         digitalWrite(BRAKE_ALARM_PIN, LOW);
+        if (micReady) i2s_stop(I2S_NUM_0); // 停止 I2S 麥克風，節省資源
         processAndBoostAudio(audioRecordBuffer, audioRecordedBytes);
         playTone(1500, 80); // 提問收音結束提示音
         audioCounter++;
